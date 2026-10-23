@@ -12,7 +12,7 @@
 ## 安装
 
 1. 从 [GitHub Releases](https://github.com/zhang1736/lol-aram-mayhem-helper/releases/latest)
-   下载 `LOL海克斯助手-v1.0.2.zip`
+   下载 `LOLHexHelper-v1.0.2.zip`
 2. 解压到任意目录（例如 `D:\LOL海克斯助手`）
 3. 完成
 

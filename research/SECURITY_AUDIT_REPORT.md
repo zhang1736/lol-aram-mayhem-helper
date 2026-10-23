@@ -113,11 +113,17 @@
 
 ## 8. GitHub 仓库地址与实际可见性
 
-**尚未创建**（等待确认名称与可见性），因此没有地址、没有 visibility。
+* 仓库：<https://github.com/zhang1736/lol-aram-mayhem-helper>
+* 可见性：**public**（自动更新需要匿名下载 Release；私有仓库无法匿名更新）
+* 默认分支：`main`
 
 ## 9. 是否推送
 
-**未推送**。仅完成本地审计、清理与本地提交。
+**已推送**：`main` → `origin/main`，提交 `09ca705`
+（`Initial release: LOL ARAM Mayhem helper v1.0.2`）。
+推送前最终扫描：180 个文件、0 命中。
+
+Release：<https://github.com/zhang1736/lol-aram-mayhem-helper/releases/tag/v1.0.2>
 
 ## 10. GitHub Releases 自动更新还需配置
 
