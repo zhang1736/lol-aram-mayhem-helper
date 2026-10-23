@@ -61,6 +61,7 @@ class UpdateClient:
         try:
             async with httpx.AsyncClient(
                     verify=verify_option(), timeout=self.timeout,
+                    follow_redirects=True,
                     headers={"User-Agent": "LOLHexHelper-Updater",
                              "Accept": "application/json"}) as client:
                 response = await client.get(self.manifest_url)
@@ -68,6 +69,9 @@ class UpdateClient:
             raise ManifestError("网络错误: %s: %s" % (type(exc).__name__, exc)) from exc
 
         logger.info("版本清单响应: HTTP %s", response.status_code)
+        # GitHub Releases 的 latest/download 会 302 到实际资产域名；只接受 HTTPS 终点
+        if not self.allow_http and response.url.scheme != "https":
+            raise ManifestError("更新源重定向到了非 HTTPS 地址，拒绝处理")
         if response.status_code != 200:
             raise ManifestError("版本清单返回 HTTP %s" % response.status_code)
         if len(response.content) > MAX_MANIFEST_BYTES:

@@ -18,6 +18,16 @@ from tests.update_helpers import make_package, sha256_bytes
 
 
 class _QuietHandler(SimpleHTTPRequestHandler):
+    redirect_target = "/manifest.json"
+
+    def do_GET(self):
+        if self.path.startswith("/redirect"):
+            self.send_response(302)
+            self.send_header("Location", self.redirect_target)
+            self.end_headers()
+            return
+        return super().do_GET()
+
     def log_message(self, *args):  # noqa: D401 - 静默测试服务器日志
         pass
 
@@ -129,6 +139,21 @@ def test_check_for_update_never_raises_on_network_error(tmp_path: Path,
                                           allow_http=True))
     assert result.status == "error"
     assert result.error
+
+
+def test_check_for_update_follows_https_style_redirect(tmp_path: Path,
+                                                       http_server) -> None:
+    """GitHub releases/latest/download 会 302，客户端必须跟随重定向。"""
+    root, base = http_server
+    payload = {"version": "1.0.2", "package_url": base + "/u.zip",
+               "sha256": "a" * 64, "release_notes": ["x"],
+               "update_type": "full", "from_versions": []}
+    (root / "manifest.json").write_text(json.dumps(payload), encoding="utf-8")
+
+    result = asyncio.run(check_for_update("1.0.1", base + "/redirect",
+                                          allow_http=True))
+    assert result.status == "update", result.error
+    assert str(result.manifest.version) == "1.0.2"
 
 
 def test_check_for_update_disabled_when_no_url() -> None:
