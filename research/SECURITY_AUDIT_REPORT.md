@@ -119,11 +119,33 @@
 
 ## 9. 是否推送
 
-**已推送**：`main` → `origin/main`，提交 `09ca705`
-（`Initial release: LOL ARAM Mayhem helper v1.0.2`）。
+**已推送**：`main` → `origin/main`。
+提交历史：
+
+```text
+9d1ae23  fix(update): follow GitHub release redirects for manifest
+4b2906a  docs: record public GitHub repo and v1.0.2 release
+09ca705  Initial release: LOL ARAM Mayhem helper v1.0.2
+```
+
 推送前最终扫描：180 个文件、0 命中。
 
 Release：<https://github.com/zhang1736/lol-aram-mayhem-helper/releases/tag/v1.0.2>
+
+已上传附件：
+
+```text
+LOLHexHelper-v1.0.2.zip                 158,306,391 bytes（首次安装）
+update-full-v1.0.2.zip                  154,364,128 bytes（完整更新）
+update-incremental-to-v1.0.2.zip         19,483,505 bytes（增量更新）
+manifest.json                                    1,322 bytes
+```
+
+稳定更新地址（已实测正式版可访问并判定最新）：
+
+```text
+https://github.com/zhang1736/lol-aram-mayhem-helper/releases/latest/download/manifest.json
+```
 
 ## 10. GitHub Releases 自动更新还需配置
 
