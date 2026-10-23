@@ -1,0 +1,23 @@
+# LOL ARAM: Mayhem 海克斯数据助手 - runtime dependencies
+#
+# Python: >=3.12,<3.13  (see .python-version)
+#
+# Day 2 installs only the lightweight core. PySide6 / RapidOCR / OpenCV / mss
+# are intentionally listed but installed later (see README notes):
+#   rapidocr_onnxruntime only supports Python 3.9-3.12
+
+httpx>=0.27
+pydantic>=2.7,<3
+PyYAML>=6.0
+
+# --- Overlay (Day 2 optional, install separately) ---
+# PySide6>=6.6
+
+# --- OCR / capture (Day 4) ---
+# rapidocr_onnxruntime<=1.4.4
+# opencv-python-headless
+# mss
+# numpy
+
+# --- Test (dev) ---
+# pytest>=8

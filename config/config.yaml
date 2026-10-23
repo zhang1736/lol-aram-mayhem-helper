@@ -1,0 +1,56 @@
+# LOL ARAM: Mayhem 海克斯数据助手 - 默认配置
+#
+# 注意术语区分（重要）：
+#   data.tier           = 统计数据口径的段位区间（ibsg = Iron/Bronze/Silver/Gold）
+#   opgg_augment_tier   = OP.GG 海克斯响应里的 tier 字段（0~5，欢迎度档位）
+#   两者完全不同，禁止混用同一个名字。
+
+data:
+  # 数据统计范围：韩国 / 黄金及以下
+  region: kr
+  tier: ibsg
+
+opgg:
+  base_url: "https://lol-api-champion.op.gg"
+  # 海克斯统计接口无法按 region/tier 过滤，scope 只能记为 aggregate
+  augment_scope: "aggregate"
+
+# 自动检查更新（发布者配置）
+# GitHub Releases 的稳定清单地址：每次发布新 tag，latest 自动指向最新 release。
+update:
+  enabled: true
+  manifest_url: "https://github.com/zhang1736/lol-aram-mayhem-helper/releases/latest/download/manifest.json"
+  check_on_startup: true
+  timeout_seconds: 15
+  allow_http: false
+
+cache:
+  # OP.GG 数据在同一 patch 内也会漂移，缓存必须带 TTL
+  # FRESH(<TTL) 直接用；STALE 先用旧值再后台刷新；MISSING 等网络
+  opgg_ttl_hours: 6
+
+lcu:
+  # 客户端进程名（国服 Tencent 客户端）
+  process_name: "LeagueClientUx.exe"
+  request_timeout: 8
+  # 常驻模式下 LCU 掉线后的重连间隔（秒）
+  reconnect_interval: 5
+
+overlay:
+  enabled: true
+  # 命中覆盖的显示器索引（0 = 主显示器）
+  screen_index: 0
+  # 透明度 0~100
+  opacity: 100
+  # 用户手动微调（像素），叠加在默认位置之上。
+  # 默认位置 = 海克斯卡片下方 70px（2560x1440 下 y=770，其他分辨率按 scale_y 缩放），
+  # 这样 Overlay 不会遮挡卡片下方的海克斯描述文字。
+  offset_x: 0
+  offset_y: 0
+
+debug:
+  enabled: false
+
+logging:
+  level: INFO
+  file: "logs/app.log"

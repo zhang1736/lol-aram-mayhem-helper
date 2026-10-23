@@ -1,0 +1,65 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.pytest_tmp/
+.mypy_cache/
+.ruff_cache/
+
+# ---- 虚拟环境 ----
+.venv/
+venv/
+env/
+
+# ---- 凭据 / 私有密钥 ----
+.env
+.env.*
+!.env.example
+*.key
+*.p12
+*.pfx
+secrets/
+.audit/
+
+# ---- 日志 / 运行时数据（属于用户隐私，绝不入库）----
+logs/
+*.log
+data/*.db
+data/*.db-*
+*.sqlite
+*.sqlite3
+data/_*
+
+# ---- 构建产物 / 发布包（走 GitHub Releases）----
+build/
+build_updater/
+dist/
+dist_updater/
+release/
+
+# ---- 本机工具安装包 ----
+tools/*.exe
+
+# ---- 研究资料：只保留报告、探针脚本与两个测试样本 ----
+research/**
+!research/*.md
+!research/*.py
+!research/captures/
+research/captures/*
+!research/captures/augment_cards_fixture.png
+!research/opgg_api/
+research/opgg_api/*
+!research/opgg_api/augments_157.json
+
+# ---- 第三方 upstream 克隆（含其自身数据/许可，不入本仓库）----
+research/upstream/
+research/opgg/
+research/opgg_js/
+
+# ---- 系统 / IDE ----
+Thumbs.db
+Desktop.ini
+.vscode/
+.idea/
+*.swp
