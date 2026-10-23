@@ -13,6 +13,7 @@ from src.data.augment_repository import (
     mode_distribution,
     parse_raw_dict,
 )
+from src.utils import paths
 
 
 @pytest.fixture(scope="module")
@@ -25,12 +26,16 @@ def repository() -> AugmentRepository:
     return repo
 
 
-def test_raw_file_is_saved_untouched() -> None:
-    path = default_raw_path()
-    assert path.exists(), "data/kiwi_augments.json 必须保留原始响应"
+def test_dictionary_contains_latest_tencent_entries() -> None:
+    path = paths.bundled_augment_dict_path()
+    assert path.exists(), "data/kiwi_augments.json 必须存在"
     payload = json.loads(path.read_text(encoding="utf-8"))
     assert isinstance(payload, list)
     assert len(payload) >= 200
+    by_id = {row["augmentID"]: row for row in payload}
+    # 2026-10-24 腾讯最新字典新增项；旧版 248 条字典不含这些 ID。
+    assert by_id[3004]["name_cn"] == "罪恶快感！"
+    assert by_id[3159]["name_cn"] == "登峰造极境"
 
 
 def test_raw_fields_match_tencent_export() -> None:
@@ -87,3 +92,22 @@ def test_mode_distribution_counts(repository: AugmentRepository) -> None:
     distribution = mode_distribution(repository.all_items)
     assert distribution
     assert sum(distribution.values()) == len(repository.all_items)
+
+
+def test_old_user_dictionary_does_not_shadow_bundled_updates(monkeypatch,
+                                                             tmp_path) -> None:
+    """已迁移到用户目录的旧字典必须与新版内置字典合并。"""
+    monkeypatch.setenv("LOL_HEX_HELPER_HOME", str(tmp_path))
+    override = tmp_path / "data" / "kiwi_augments.json"
+    override.parent.mkdir(parents=True, exist_ok=True)
+    override.write_text(json.dumps([{
+        "augmentID": 1077,
+        "name_cn": "灵魂虹吸",
+        "name_en": "ARAM_SoulSiphon",
+        "mode": "KIWI",
+        "level": "kGold",
+    }], ensure_ascii=False), encoding="utf-8")
+
+    repo = AugmentRepository().load()
+    assert repo.get(1077).name_cn == "灵魂虹吸"
+    assert repo.get(3004).name_cn == "罪恶快感！"

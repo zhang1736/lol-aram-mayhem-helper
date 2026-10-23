@@ -40,11 +40,13 @@ def hero_text(name: Optional[str], alias: Optional[str]) -> str:
     return name or alias or "-"
 
 
-def stage_text(stage: Optional[int], level: Optional[int]) -> str:
+def stage_text(stage: Optional[int], level: Optional[int],
+               augment_round: Optional[int] = None) -> str:
     """普通用户优先看"第 N 次海克斯"。"""
-    if not stage:
+    display_round = augment_round or stage
+    if not display_round:
         return "-"
-    text = "第 %d 次海克斯" % stage
+    text = "第 %d 次海克斯" % display_round
     if level:
         text += " · Lv.%d" % level
     return text

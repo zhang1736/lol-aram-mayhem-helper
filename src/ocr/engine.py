@@ -10,6 +10,8 @@ Day 3 范围：输入一张截图（路径 / ndarray / PIL）-> 输出文字。
 
 from __future__ import annotations
 
+import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional, Sequence
@@ -69,7 +71,11 @@ def _to_bbox(box: Sequence[Sequence[float]] | None) -> tuple[int, int, int, int]
 
 
 class OcrEngine:
-    """RapidOCR 包装器（懒加载，首次 recognize 时才初始化模型）。"""
+    """RapidOCR 包装器。
+
+    保留懒加载语义供测试/独立调用使用；正式常驻流程会在启动后由后台线程
+    调用 ``start_ocr_prewarm()``，让约 0.9 秒的模型初始化不再落进第一次海克斯。
+    """
 
     def __init__(self, engine: Any | None = None,
                  intra_op_num_threads: int | None = OCR_INTRA_OP_THREADS,
@@ -80,6 +86,8 @@ class OcrEngine:
         self.intra_op_num_threads = intra_op_num_threads
         self.inter_op_num_threads = inter_op_num_threads
         self.thread_limit_applied = False
+        self.init_ms = 0.0
+        self._init_lock = threading.RLock()
 
     @property
     def backend(self) -> Optional[str]:
@@ -94,33 +102,40 @@ class OcrEngine:
             return False
 
     def _ensure_engine(self) -> Any:
-        if self._engine is None:
-            rapidocr_cls, backend = _load_rapidocr()
-            kwargs = {}
-            if self.intra_op_num_threads:
-                kwargs["intra_op_num_threads"] = int(self.intra_op_num_threads)
-            if self.inter_op_num_threads:
-                kwargs["inter_op_num_threads"] = int(self.inter_op_num_threads)
-            try:
-                self._engine = rapidocr_cls(**kwargs) if kwargs else rapidocr_cls()
-                self.thread_limit_applied = bool(kwargs)
-            except TypeError:
-                # 老版本 / 新包名(rapidocr) 不支持这两个 kwarg：
-                # 退回默认构造（**不重写 RapidOCR**），只记日志。
-                if not kwargs:
-                    raise
-                logger.warning("RapidOCR 不支持线程参数 %s，退回默认线程配置", kwargs)
+        # 预热线程与识别线程可能同时到达；锁保证整个进程只创建一个模型实例。
+        with self._init_lock:
+            if self._engine is None:
+                started = time.perf_counter()
+                rapidocr_cls, backend = _load_rapidocr()
+                kwargs = {}
+                if self.intra_op_num_threads:
+                    kwargs["intra_op_num_threads"] = int(self.intra_op_num_threads)
+                if self.inter_op_num_threads:
+                    kwargs["inter_op_num_threads"] = int(self.inter_op_num_threads)
                 try:
-                    self._engine = rapidocr_cls()
-                except Exception as exc:  # noqa: BLE001
+                    self._engine = rapidocr_cls(**kwargs) if kwargs else rapidocr_cls()
+                    self.thread_limit_applied = bool(kwargs)
+                except TypeError:
+                    # 老版本 / 新包名(rapidocr) 不支持这两个 kwarg：
+                    # 退回默认构造（**不重写 RapidOCR**），只记日志。
+                    if not kwargs:
+                        raise
+                    logger.warning("RapidOCR 不支持线程参数 %s，退回默认线程配置", kwargs)
+                    try:
+                        self._engine = rapidocr_cls()
+                    except Exception as exc:  # noqa: BLE001
+                        raise OcrUnavailableError(
+                            f"RapidOCR 初始化失败: {exc}") from exc
+                except Exception as exc:  # noqa: BLE001 - 失败时保留可重试状态
                     raise OcrUnavailableError(f"RapidOCR 初始化失败: {exc}") from exc
-            except Exception as exc:  # noqa: BLE001 - 模型初始化失败也要给明确错误
-                raise OcrUnavailableError(f"RapidOCR 初始化失败: {exc}") from exc
-            self._backend = backend
-            threads = self.onnx_threads()
-            logger.info("RapidOCR 初始化完成 (backend=%s, 线程限制=%s, ONNX线程=%s)",
-                        backend, kwargs or "默认", threads or "未知")
-        return self._engine
+                self.init_ms = (time.perf_counter() - started) * 1000.0
+                self._backend = backend
+                threads = self.onnx_threads()
+                logger.info(
+                    "RapidOCR 初始化完成 (backend=%s, 耗时=%.1f ms, "
+                    "线程限制=%s, ONNX线程=%s)",
+                    backend, self.init_ms, kwargs or "默认", threads or "未知")
+            return self._engine
 
     # -- 诊断 ---------------------------------------------------------------
     def ensure_ready(self) -> Any:
@@ -212,5 +227,42 @@ class OcrEngine:
         return sep.join(self.recognize_texts(image, use_det=use_det))
 
 
+_SHARED_ENGINE: Optional[OcrEngine] = None
+_SHARED_LOCK = threading.Lock()
+_PREWARM_THREAD: Optional[threading.Thread] = None
+
+
+def shared_ocr_engine() -> OcrEngine:
+    """正式流程共享的唯一 OCR 实例。"""
+    global _SHARED_ENGINE
+    with _SHARED_LOCK:
+        if _SHARED_ENGINE is None:
+            _SHARED_ENGINE = OcrEngine()
+        return _SHARED_ENGINE
+
+
+def start_ocr_prewarm() -> threading.Thread:
+    """在后台预热共享 OCR；重复调用不会创建第二个模型实例。"""
+    global _PREWARM_THREAD
+    engine = shared_ocr_engine()
+    with _SHARED_LOCK:
+        if _PREWARM_THREAD is not None and _PREWARM_THREAD.is_alive():
+            return _PREWARM_THREAD
+
+        def worker() -> None:
+            try:
+                engine.ensure_ready()
+                logger.info("OCR 后台预热完成（%.1f ms，正式流程可直接复用）",
+                            engine.init_ms)
+            except Exception as exc:  # noqa: BLE001 - 预热失败不能影响主程序
+                logger.warning("OCR 后台预热失败（识别时会自动重试）: %s", exc)
+
+        thread = threading.Thread(target=worker, name="ocr-prewarm", daemon=True)
+        _PREWARM_THREAD = thread
+        thread.start()
+        return thread
+
+
 __all__ = ["OcrEngine", "OcrResult", "OcrUnavailableError",
-           "OCR_INTRA_OP_THREADS", "OCR_INTER_OP_THREADS"]
+           "OCR_INTRA_OP_THREADS", "OCR_INTER_OP_THREADS",
+           "shared_ocr_engine", "start_ocr_prewarm"]

@@ -230,6 +230,30 @@ def test_game_end_still_hides_overlay(monkeypatch, temp_database,
     assert events[-1].get("offers") == []
 
 
+def test_selected_augment_pending_slots_still_hides_overlay(
+        monkeypatch, temp_database, real_ocr_engine) -> None:
+    """选完海克斯后三槽都识别失败，不能被 pending 无限保留。"""
+    screen = ReplayScreen(SCREENSHOT)
+    clock = FakeClock()
+
+    def on_call(index, replay_screen, fake_clock):
+        fake_clock.advance(0.30)
+        if index == 2:
+            # 海克斯界面被收走，名称带变成普通游戏画面。
+            replay_screen.frame[:, :, :] = 0
+
+    result = run_replay(
+        monkeypatch, temp_database, real_ocr_engine, screen,
+        on_call=on_call, clock=clock, max_reads=8)
+    events = result["events"]
+    game_end_index = max(i for i, event in enumerate(events)
+                         if event.get("gameflow") == "None")
+    hide_before_game_end = any(
+        event.get("overlay_visible") is False and event.get("offers") == []
+        for event in events[:game_end_index])
+    assert hide_before_game_end, "选择完成后必须在 MISS_SECONDS 后隐藏浮层"
+
+
 # ------------------------------------------------- 3) GUI 层 OverlayMode 断言
 @pytest.fixture(scope="module")
 def qapp():

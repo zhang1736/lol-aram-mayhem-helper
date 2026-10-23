@@ -118,6 +118,13 @@ def test_empty_input_is_safe(matcher: AugmentMatcher) -> None:
     assert matcher.match("   ").augment_id is None
 
 
+def test_new_tencent_augment_names_match(matcher: AugmentMatcher) -> None:
+    """2026-10-24 新补丁名称必须映射到腾讯 augmentId。"""
+    assert matcher.match("罪恶快感！").augment_id == 3004
+    assert matcher.match("登峰造极境").augment_id == 3159
+    assert matcher.match("小蜜蜂！！！").augment_id == 3086
+
+
 def test_module_level_helper_never_raises() -> None:
     result = match_augment("随便什么文本")
     assert isinstance(result, AugmentMatch)

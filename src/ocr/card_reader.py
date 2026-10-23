@@ -21,10 +21,19 @@ DEFAULT_INTERVAL = 0.35
 DEFAULT_REQUIRED_STABLE = 3
 DEFAULT_TIMEOUT = 12.0
 
-#: 同一个 slot 两次 OCR 之间的最小间隔（§10）。
-#: 即使像素一直在变（动画/游戏画面），也不会 0.25s 一次地重复 OCR，
-#: 只更新哈希；等过了这个间隔再 OCR 一次，拿到"最后稳定"的名字。
-MIN_SLOT_OCR_INTERVAL = 0.75
+#: 同一个 slot 两次 OCR 之间的硬保护。
+#: 正常情况下优先用"连续两帧相同"快速确认；动画一直变化时由 0.35s
+#: 超时兜底。0.45s 同时防止动画播放期间每个变化帧都跑一次 OCR。
+MIN_SLOT_OCR_INTERVAL = 0.45
+#: 换牌后同一新帧连续出现的次数；两帧相同才允许对变化槽 OCR。
+CHANGE_CONFIRMATIONS_REQUIRED = 2
+#: 换牌动画可能逐帧变化，永远没有两个完全相同的哈希。检测到真实变化后，
+#: 最迟等待这么久就必须对当前帧尝试一次 OCR，避免刷新后永远卡在待确认。
+MIN_REROLL_SETTLE_SECONDS = 0.35
+#: 同一帧 OCR 未匹配后的重试冷却与次数。单帧模型偶发空结果不能把卡槽
+#: 永久钉死在失败状态；但也不能每次都跑 OCR。
+FAILED_FRAME_RETRY_SECONDS = 0.75
+MAX_FAILED_FRAME_ATTEMPTS = 2
 
 #: 判断"画面只是动画/光照"还是"真的换牌了"的像素差异阈值（2026-09-22 实测）：
 #:   真换牌（不同海克斯）：平均差 16.0~22.1，强变化像素 8.1~13.6%
@@ -102,6 +111,8 @@ class OfferSet:
     pending_slots: list[int] = field(default_factory=list)
     #: 当前像素已经确认过的卡槽下标（读数可信，不需要重试）
     confirmed_slots: list[int] = field(default_factory=list)
+    #: 本次 read_once 的墙钟分段指标
+    metrics: "ReadMetrics" = field(default_factory=lambda: ReadMetrics())
 
     @property
     def signature(self) -> tuple[Optional[int], Optional[int], Optional[int]]:
@@ -142,6 +153,17 @@ class OfferSet:
         )
 
 
+@dataclass
+class ReadMetrics:
+    screenshot_ms: float = 0.0
+    ocr_ms: float = 0.0
+    detect_ms: float = 0.0
+    stabilize_ms: float = 0.0
+    total_ms: float = 0.0
+    ocr_calls: int = 0
+    slot_ocr_calls: list[int] = field(default_factory=lambda: [0, 0, 0])
+
+
 class CardReader:
     """三卡识别器。capture 可注入（便于测试）。"""
 
@@ -169,8 +191,14 @@ class CardReader:
         self._probe_hash: Optional[str] = None
         self._slot_hashes: list[str] | None = None
         self._slot_readings: list[CardReading] | None = None
+        #: 换牌候选帧：同一新帧连续出现两次后才允许 OCR
+        self._slot_candidate_hash: list[Optional[str]] = [None, None, None]
+        self._slot_candidate_count: list[int] = [0, 0, 0]
+        self._slot_changed_since: list[Optional[float]] = [None, None, None]
         #: 每个 slot 上一次"识别失败"的那一帧哈希：同一帧不重复重试
         self._slot_failed_hash: list[Optional[str]] = [None, None, None]
+        self._slot_failed_at: list[float] = [float("-inf")] * 3
+        self._slot_failed_attempts: list[int] = [0, 0, 0]
         #: 每个 slot 上次"确认过"的卡面图（用来判断是动画还是真换牌）
         self._slot_ref_image: list[Any] = [None, None, None]
         #: 每个 slot 进入"等确认"状态的起始时间（用于长时间确认不出来的兜底）
@@ -217,12 +245,19 @@ class CardReader:
         pending: list[int] = []
         confirmed: list[int] = []
         now = self.clock()
+        wall_started = time.perf_counter()
+        screenshot_ms = 0.0
+        ocr_ms = 0.0
+        stabilize_ms = 0.0
+        slot_ocr_calls = [0, 0, 0]
 
         band = None
         frame = None
         try:
             band = roi.capture_bounds()
+            screenshot_started = time.perf_counter()
             frame = self.capture.grab_region(band)
+            screenshot_ms = (time.perf_counter() - screenshot_started) * 1000.0
         except Exception as exc:  # noqa: BLE001
             logger.warning("整条名称带截图失败: %s", exc)
 
@@ -245,7 +280,11 @@ class CardReader:
                 # 1) 与该槽上次确认时的像素一模一样 → 读数依然可信，不 OCR
                 self.slot_states[index] = SlotOcrState.STABLE
                 self._slot_failed_hash[index] = None
+                self._slot_failed_attempts[index] = 0
                 self._slot_pending_since[index] = None
+                self._slot_candidate_hash[index] = None
+                self._slot_candidate_count[index] = 0
+                self._slot_changed_since[index] = None
                 if previous.matched:
                     confirmed.append(index)
                 readings.append(_reuse_reading(previous))
@@ -258,6 +297,9 @@ class CardReader:
                 self.cosmetic_ignored += 1
                 self.slot_states[index] = SlotOcrState.STABLE
                 self._slot_pending_since[index] = None
+                self._slot_candidate_hash[index] = None
+                self._slot_candidate_count[index] = 0
+                self._slot_changed_since[index] = None
                 if previous is not None and previous.matched:
                     confirmed.append(index)
                 readings.append(_reuse_reading(previous) if previous is not None
@@ -269,8 +311,22 @@ class CardReader:
             #: 这个槽从来没被确认过 → 任何"还没识别出来"的状态都该显示"识别中…"
             never_recognized = previous is None or not previous.matched
             pending_now = reroll_like or never_recognized
-            if now - self._slot_ocr_at[index] < self.min_slot_ocr_interval:
-                # 3) 最小间隔保护：先不 OCR；只有"像真换牌"才标记识别中…
+            if digest == self._slot_candidate_hash[index]:
+                self._slot_candidate_count[index] += 1
+            else:
+                self._slot_candidate_hash[index] = digest
+                self._slot_candidate_count[index] = 1
+            if self._slot_changed_since[index] is None:
+                self._slot_changed_since[index] = now
+            stable_new_frame = (
+                never_recognized
+                or self._slot_candidate_count[index] >= CHANGE_CONFIRMATIONS_REQUIRED
+                or (now - self._slot_changed_since[index]
+                    >= MIN_REROLL_SETTLE_SECONDS))
+            hard_interval_elapsed = (
+                now - self._slot_ocr_at[index] >= self.min_slot_ocr_interval)
+            if not hard_interval_elapsed or not stable_new_frame:
+                # 3) 动画帧持续变化时不 OCR；新卡至少连续两帧一致才进入识别。
                 self.deferred += 1
                 if pending_now:
                     self.slot_states[index] = SlotOcrState.CHANGED_PENDING
@@ -288,7 +344,14 @@ class CardReader:
                 continue
 
             if digest == self._slot_failed_hash[index]:
-                # 这一帧已经试过且没识别出来：不再重试（等像素变化）
+                retry_due = (
+                    self._slot_failed_attempts[index] < MAX_FAILED_FRAME_ATTEMPTS
+                    and now - self._slot_failed_at[index] >= FAILED_FRAME_RETRY_SECONDS
+                )
+            else:
+                retry_due = False
+            if digest == self._slot_failed_hash[index] and not retry_due:
+                # 这一帧刚试过且没识别出来：冷却期内不重复 OCR
                 if pending_now:
                     self.slot_states[index] = SlotOcrState.CHANGED_PENDING
                     pending.append(index)
@@ -306,28 +369,42 @@ class CardReader:
 
             # ROI 已经是裁好的单行文字：跳过检测模型（实测快 20~30 倍）
             self.slot_states[index] = SlotOcrState.OCR_IN_PROGRESS
+            ocr_started = time.perf_counter()
             texts = self.engine.recognize_texts(image, use_det=False)
+            ocr_ms += (time.perf_counter() - ocr_started) * 1000.0
             raw = "".join(texts).strip()
             match = matcher.match(raw)
             self.ocr_calls += 1
+            slot_ocr_calls[index] += 1
             self._slot_ocr_at[index] = now
 
             if match.augment_id is None:
                 # 4c) 没认出来：保留旧读数；变化大才算"换牌进行中"
+                if self._slot_failed_hash[index] != digest:
+                    self._slot_failed_attempts[index] = 1
+                else:
+                    self._slot_failed_attempts[index] += 1
                 self._slot_failed_hash[index] = digest
+                self._slot_failed_at[index] = now
                 if pending_now:
                     self.slot_states[index] = SlotOcrState.CHANGED_PENDING
                     pending.append(index)
                     if self._slot_pending_since[index] is None:
                         self._slot_pending_since[index] = now
-                    logger.debug("slot%d 换牌中未识别(%r)，保留旧读数并等待重试", index, raw)
+                    logger.info(
+                        "slot%d 换牌中未识别 raw=%r best=%.3f attempt=%d",
+                        index, raw, match.confidence,
+                        self._slot_failed_attempts[index])
                 else:
                     # 已经识别过的槽：一帧 OCR 失败**不允许**把它降级成"识别中…"
                     self.slot_states[index] = SlotOcrState.STABLE
                     self._slot_pending_since[index] = None
                     if previous.matched:
                         confirmed.append(index)
-                    logger.debug("slot%d OCR 未匹配(%r)，保持已识别结果", index, raw)
+                    logger.info(
+                        "slot%d OCR 未匹配 raw=%r best=%.3f attempt=%d，保持已识别结果",
+                        index, raw, match.confidence,
+                        self._slot_failed_attempts[index])
                 readings.append(_reuse_reading(previous) if previous is not None
                                 else CardReading(index + 1, raw, normalize_text(raw),
                                                  None, None, match.confidence, match.method))
@@ -336,9 +413,18 @@ class CardReader:
 
             same_as_before = (previous is not None
                               and previous.augment_id == match.augment_id)
+            if self._slot_pending_since[index] is not None:
+                stabilize_ms = max(
+                    stabilize_ms,
+                    (now - self._slot_pending_since[index]) * 1000.0,
+                )
             self.slot_states[index] = SlotOcrState.STABLE
             self._slot_failed_hash[index] = None
+            self._slot_failed_attempts[index] = 0
             self._slot_pending_since[index] = None
+            self._slot_candidate_hash[index] = None
+            self._slot_candidate_count[index] = 0
+            self._slot_changed_since[index] = None
             confirmed.append(index)
             self._slot_ref_image[index] = image.copy()
             readings.append(CardReading(
@@ -357,8 +443,18 @@ class CardReader:
 
         self._slot_hashes = hashes
         self._slot_readings = readings
+        total_ms = (time.perf_counter() - wall_started) * 1000.0
+        metrics = ReadMetrics(
+            screenshot_ms=screenshot_ms,
+            ocr_ms=ocr_ms,
+            detect_ms=max(0.0, total_ms - screenshot_ms - ocr_ms),
+            stabilize_ms=stabilize_ms,
+            total_ms=total_ms,
+            ocr_calls=sum(slot_ocr_calls),
+            slot_ocr_calls=slot_ocr_calls,
+        )
         offer = OfferSet(readings=readings, pending_slots=pending,
-                         confirmed_slots=confirmed)
+                         confirmed_slots=confirmed, metrics=metrics)
         logger.debug("三卡识别: %s", offer.describe())
         return offer
 
@@ -372,8 +468,13 @@ class CardReader:
         self._slot_readings = None
         self._slot_ref_image = [None, None, None]
         self._slot_failed_hash = [None, None, None]
+        self._slot_failed_at = [float("-inf")] * 3
+        self._slot_failed_attempts = [0, 0, 0]
         self._slot_pending_since = [None, None, None]
         self._slot_sample_hash = [None, None, None]
+        self._slot_candidate_hash = [None, None, None]
+        self._slot_candidate_count = [0, 0, 0]
+        self._slot_changed_since = [None, None, None]
         self.slot_states = [SlotOcrState.UNCHANGED] * 3
         if reason:
             logger.info("逐槽基线已清空（%s）→ 下一次全量识别", reason)
@@ -414,12 +515,39 @@ class CardReader:
                 # 同一帧不再重试；等像素真正变化后再重新识别
                 self._slot_hashes[index] = self._slot_sample_hash[index]
             self._slot_failed_hash[index] = self._slot_sample_hash[index]
+            self._slot_failed_at[index] = self.clock()
+            self._slot_failed_attempts[index] = MAX_FAILED_FRAME_ATTEMPTS
             self.slot_states[index] = SlotOcrState.UNCHANGED
             self._slot_pending_since[index] = None
             dropped.append(index)
         if dropped:
             logger.info("卡槽长时间无法识别，降级为未识别（内部终结态）: %s", dropped)
         return dropped
+
+    def retry_unresolved(self, slots) -> list[int]:
+        """给长时间未识别的槽重新开放同帧 OCR 重试。
+
+        不清空已经识别出的名称，也不隐藏 Overlay；仅清除失败帧的冷却，
+        由下一次 read_once 重新识别。重试时间基准同步刷新，避免每轮扫描
+        都重复打印。
+        """
+        retried: list[int] = []
+        moment = self.clock()
+        for slot in slots or ():
+            try:
+                index = int(slot)
+            except (TypeError, ValueError):
+                continue
+            if not 0 <= index < 3:
+                continue
+            self._slot_failed_hash[index] = None
+            self._slot_failed_attempts[index] = 0
+            self._slot_failed_at[index] = float("-inf")
+            self._slot_pending_since[index] = moment
+            retried.append(index)
+        if retried:
+            logger.info("长时间未识别，重新开放 OCR 重试: %s", retried)
+        return retried
 
     def probe_feature(self) -> BandFeature:
         """只抓名称带算哈希/亮度：不 OCR、不改 slot 状态。
@@ -553,7 +681,11 @@ def _hash_image(image) -> str:
 
 
 __all__ = ["CardReader", "CardReading", "OfferSet", "SlotOcrState", "BandFeature",
+           "ReadMetrics",
            "PixelDiff", "DEFAULT_INTERVAL", "DEFAULT_REQUIRED_STABLE",
            "DEFAULT_TIMEOUT", "MIN_SLOT_OCR_INTERVAL",
+           "CHANGE_CONFIRMATIONS_REQUIRED",
+           "MIN_REROLL_SETTLE_SECONDS",
+           "FAILED_FRAME_RETRY_SECONDS", "MAX_FAILED_FRAME_ATTEMPTS",
            "CARD_CHANGE_IGNORE_MEAN", "CARD_CHANGE_IGNORE_STRONG",
            "CARD_REROLL_MEAN", "CARD_REROLL_STRONG", "CARD_DIFF_STRONG_LEVEL"]

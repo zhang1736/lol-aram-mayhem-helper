@@ -159,3 +159,76 @@ def test_missing_image_capture_does_not_crash(tmp_path: Path) -> None:
     assert len(offer.readings) == 3
     assert not offer.complete
     assert offer.signature == (None, None, None)
+
+
+def test_same_frame_ocr_failure_is_retried_after_cooldown() -> None:
+    """同一新卡帧偶发 OCR 空结果时，冷却后必须重试，不能永久卡死。"""
+    from src.ocr.card_reader import FAILED_FRAME_RETRY_SECONDS
+    from tests.test_ocr_gate import SlotFakeEngine, _reader
+
+    class FailOnceEngine(SlotFakeEngine):
+        def __init__(self) -> None:
+            super().__init__()
+            self.failed = False
+
+        def recognize_texts(self, image, use_det=None):
+            slot = int(image[1, 1, 0]) // 10 - 1
+            if slot == 1 and not self.failed:
+                self.failed = True
+                self.calls.append(slot)
+                return [""]
+            return super().recognize_texts(image, use_det=use_det)
+
+    class Clock:
+        now = 0.0
+
+        def __call__(self):
+            return self.now
+
+    clock = Clock()
+    capture, _, reader = _reader(clock=clock)
+    reader.read_once()
+    reader.engine = FailOnceEngine()
+
+    capture.set_slot(1, 3)
+    clock.now += 0.25
+    reader.read_once()                           # 第一帧只建立候选
+    clock.now += 0.25
+    failed = reader.read_once()                  # 第二次 OCR 故意返回空
+    assert failed.pending_slots == [1]
+
+    clock.now += FAILED_FRAME_RETRY_SECONDS + 0.01
+    retried = reader.read_once()
+    assert retried.readings[1].augment_id == 1079
+    assert retried.readings[1].reused is False
+
+
+def test_changing_reroll_animation_still_ocr_after_settle_timeout() -> None:
+    """刷新动画逐帧变化、没有两帧相同时，也必须在短等待后 OCR。"""
+    from src.ocr.card_reader import MIN_REROLL_SETTLE_SECONDS
+    from tests.test_ocr_gate import _reader
+
+    class Clock:
+        now = 0.0
+
+        def __call__(self):
+            return self.now
+
+    clock = Clock()
+    capture, engine, reader = _reader(clock=clock)
+    reader.read_once()
+    engine.calls.clear()
+
+    capture.set_slot(1, 3)
+    clock.now += MIN_REROLL_SETTLE_SECONDS / 2
+    first = reader.read_once()
+    assert first.pending_slots == [1]
+    assert engine.calls == []
+
+    # 动画继续变化，最终帧与上一采样仍不一致。
+    capture.set_slot(1, 1)
+    clock.now += MIN_REROLL_SETTLE_SECONDS + 0.01
+    updated = reader.read_once()
+    assert engine.calls == [1]
+    assert updated.readings[1].augment_id == 1325
+    assert updated.readings[1].reused is False

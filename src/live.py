@@ -47,6 +47,7 @@ ocr_log = get_tagged("ocr")
 augment_log = get_tagged("augment")
 flow_log = get_tagged("flow")
 overlay_log = get_tagged("overlay")
+perf_log = get_tagged("flow", "perf")
 
 MISS_LIMIT = 3
 
@@ -56,8 +57,9 @@ _SESSION_SEQ = itertools.count(1)
 #: 选人阶段轮询候选英雄的间隔（秒）；换英雄是玩家操作，秒级足够
 CHAMP_SELECT_POLL_SECONDS = 1.0
 
-#: Live Client 等级轮询间隔（秒）：等级变化慢，不需要 0.25s（§15）
-LEVEL_POLL_INTERVAL = 1.0
+#: Live Client 等级轮询间隔（秒）。0.5s 只发本机 HTTP 请求，开销很小；
+#: 同时把"第一次选取后进入下一 stage"的最坏发现等待从 1s 降到 0.5s。
+LEVEL_POLL_INTERVAL = 0.5
 
 #: 某张卡长时间确认不出来时的兜底秒数（只在"本 stage 还没有可用快照"时生效）
 SNAPSHOT_GIVEUP_SECONDS = 6.0
@@ -67,6 +69,10 @@ CLIENT_MAX_FAILURES = 5
 
 #: 判定"海克斯界面消失"还需要持续这么久（秒），避免单帧 OCR 失败就清空
 MISS_SECONDS = 1.2
+
+#: 已显示牌面后三槽同时消失多久，就先记为"轮次边界"。
+#: 它早于 1.2 秒隐藏判定，用于极快的同等级下一轮不被误当成槽位刷新。
+ROUND_GAP_CONFIRM_SECONDS = 0.25
 
 #: 常驻主循环的停止信号（由 resident() 注入），供各层循环检查
 _STOP: list = [None]
@@ -248,6 +254,7 @@ def publish_offers(overlay, payload: list[dict], pending_slots=(),
     """
     if not isinstance(overlay, HubOverlay):
         overlay.update_offers(payload, pending_slots)
+    extra.setdefault("offers_updated_at", time.perf_counter())
     HUB.update(offers=payload, overlay_visible=True,
                recommended=list(recommended), **extra)
 
@@ -507,12 +514,13 @@ def reset_hub_session_state(hub=None):
         candidate_champion_id=None, candidate_champion_alias=None,
         candidate_champion_name=None,
         final_champion_id=None, final_champion_alias=None, final_champion_name=None,
-        level=None, stage=None,
+        level=None, stage=None, augment_round=0,
         offers=[], overlay_visible=False, offer_version=0,
         changed_slots=[], rerolled_slots=[], recommended=[],
         ocr_texts=[], cache_status=CacheStatus.MISSING.value, data_patch=None,
         scan_mode="-", ocr_calls=0,
         gameflow=GamePhase.NONE.value,
+        perf_trace=None, offers_updated_at=0.0,
     )
 
 
@@ -560,6 +568,7 @@ async def play_one_game(settings: Settings, args, client: LcuClient,
     """跑完一局。返回 'game_end' / 'disconnected' / 'no_game'。"""
     from src.ocr.capture import ScreenCapture
     from src.ocr.card_reader import CardReader
+    from src.ocr.engine import shared_ocr_engine
 
     session_id = next(_SESSION_SEQ)
     # 新一局：Session 作用域清零（SQLite / 用户设置 / 字典一律保留）
@@ -597,7 +606,8 @@ async def play_one_game(settings: Settings, args, client: LcuClient,
         print("ChampionId: %s" % champion_id)
         print("Alias: %s" % session.champion_alias)
 
-        reader = CardReader(capture, interval=args.scan_interval)
+        reader = CardReader(capture, ocr_engine=shared_ocr_engine(),
+                            interval=args.scan_interval)
         #: 海克斯扫描门控（P0-2）：只在"该看牌面"时才抓屏 / OCR
         gate = AugmentScanGate(
             scan_interval=args.scan_interval,
@@ -620,6 +630,13 @@ async def play_one_game(settings: Settings, args, client: LcuClient,
         last_stage = session.stage
         #: 连续"三槽都确认不了"的起始时间（配合 MISS_SECONDS 做时间判定）
         miss_since = None
+        #: 本局已经出现过的 stage，用于区分首次和"第一次选取后的下一轮"
+        seen_stages: set[int] = set()
+        #: 本局实际海克斯轮次，不受等级上限限制；KDA 额外轮次可为 5。
+        augment_round = 0
+        round_boundary_pending = False
+        round_boundary_since = None
+        last_pending_notice = 0.0
 
         while True:
             if _stopping():
@@ -670,7 +687,8 @@ async def play_one_game(settings: Settings, args, client: LcuClient,
                     await tracker.confirm_final(snapshot)
                     if snapshot.level:
                         session.set_level(snapshot.level)
-                        HUB.update(level=snapshot.level, stage=session.stage)
+                        HUB.update(level=snapshot.level, stage=session.stage,
+                                   augment_round=augment_round)
 
             # 英雄在本次识别前发生变化 -> 上一套牌面与统计全部作废
             if session.active_champion_id != active_at_scan:
@@ -711,7 +729,8 @@ async def play_one_game(settings: Settings, args, client: LcuClient,
                         overlay, payload, pending_now, recommended,
                         cache_status=provider.stats_state(
                             session.active_champion_id).value,
-                        ocr_calls=reader.ocr_calls)
+                        ocr_calls=reader.ocr_calls,
+                        offers_updated_at=time.perf_counter())
                     augment_log.info(
                         "OP.GG 数据到位（version=%s, state=%s），已刷新强度/欢迎度：%d/3 槽",
                         stats_version,
@@ -721,7 +740,7 @@ async def play_one_game(settings: Settings, args, client: LcuClient,
             gate.update_stage(session.stage, now)
             mode = gate.mode(now)
             if mode is ScanMode.WATCHDOG:
-                # 低频（1 次/秒）只看"画面是不是静止 / 亮度是不是跳变"，不做 OCR
+                # 低频（默认 0.35s）只看"画面是不是静止 / 亮度是不是跳变"，不做 OCR
                 feature = reader.probe_feature()
                 if gate.observe(feature, now):
                     augment_log.info("[GATE] 低频检测命中（stable=%s bright=%.0f），"
@@ -736,7 +755,6 @@ async def play_one_game(settings: Settings, args, client: LcuClient,
                 break
 
             HUB.update(scan_mode=mode.value)
-            flow.set_state(AugmentFlowState.SCANNING)
             scan_started = time.perf_counter()
             try:
                 offer = reader.read_once()
@@ -745,12 +763,45 @@ async def play_one_game(settings: Settings, args, client: LcuClient,
                 await pump_qt()
                 await _sleep(args.scan_interval)
                 continue
-            HUB.perf.record("ocr", time.perf_counter() - scan_started)
+            metrics = getattr(offer, "metrics", None)
+            if metrics is None:
+                # 兼容测试注入的 FakeCardReader。
+                from src.ocr.card_reader import ReadMetrics
+
+                elapsed = (time.perf_counter() - scan_started) * 1000.0
+                metrics = ReadMetrics(
+                    detect_ms=elapsed, total_ms=elapsed,
+                    ocr_calls=max(0, len(offer.readings)),
+                    slot_ocr_calls=[
+                        1 if reading.matched else 0
+                        for reading in offer.readings
+                    ][:3],
+                )
+            HUB.perf.record("ocr", metrics.ocr_ms / 1000.0)
+            if metrics.ocr_calls:
+                flow.set_state(AugmentFlowState.SCANNING)
+
+            pending_slots = set(offer.pending_slots)
+            # 已经显示过浮层时，三槽都无法匹配到牌面应进入消失判定；
+            # 只有首次识别（last_signature 为空）的失败才无条件重试。
+            if pending_slots and last_signature is None:
+                gate.note_offers(True, now)
+            stuck = [slot for slot in pending_slots
+                     if reader.pending_age(slot) >= SNAPSHOT_GIVEUP_SECONDS]
+            if stuck:
+                reader.retry_unresolved(stuck)
 
             # §6/§10/§13：只有"三个槽一个都确认不了"才算界面消失。
             # 单槽刷新动画 / 单槽 OCR 失败时，另外两槽仍处于 STABLE →
             # 绝不允许把整个 Overlay 清掉。
             if not offer.confirmed_slots:
+                if last_signature is not None:
+                    if round_boundary_since is None:
+                        round_boundary_since = now
+                    elif now - round_boundary_since >= ROUND_GAP_CONFIRM_SECONDS:
+                        round_boundary_pending = True
+                else:
+                    round_boundary_since = None
                 miss_count += 1
                 if miss_since is None:
                     miss_since = now
@@ -769,30 +820,36 @@ async def play_one_game(settings: Settings, args, client: LcuClient,
                     published_stage = None
                     gate.note_offers(False, now)
                     flow.set_state(AugmentFlowState.WAIT_AUGMENT)
+                    reader.reset_slots("海克斯界面消失")
+                    round_boundary_pending = True
+                    round_boundary_since = None
+                    last_pending_notice = 0.0
+                elif pending_slots and now - last_pending_notice >= 2.0:
+                    last_pending_notice = now
+                    augment_log.info(
+                        "三槽暂未确认 slots=%s，等待界面消失判定或重新识别",
+                        sorted(pending_slots))
                 await pump_qt()
                 await _sleep(args.scan_interval)
                 continue
 
             miss_count = 0
             miss_since = None
-            pending_slots = set(offer.pending_slots)
+            round_boundary_since = None
             if pending_slots:
                 # 后台还在确认（刷新/动画/重试）→ **界面完全不动**，
                 # 继续显示上一份已确认快照（绝不出现"识别中"）。
-                augment_log.info("后台确认中 slots=%s（界面保持上一份已确认快照）",
-                                 sorted(pending_slots))
-                if published_stage != session.stage:
-                    # 这个 stage 还没有任何可用快照：长时间确认不出来就降级为
-                    # "未识别"（终结态），避免整局空白/旧牌面一直挂着。
-                    stuck = [slot for slot in pending_slots
-                             if reader.pending_age(slot) >= SNAPSHOT_GIVEUP_SECONDS]
-                    if stuck:
-                        reader.drop_unresolved(stuck)
+                if now - last_pending_notice >= 2.0:
+                    last_pending_notice = now
+                    augment_log.info(
+                        "后台确认中 slots=%s（界面保持上一份已确认快照）",
+                        sorted(pending_slots))
                 await pump_qt()
                 await _sleep(args.scan_interval)
                 continue
 
             if offer.signature == last_signature:
+                round_boundary_pending = False
                 await pump_qt()
                 await _sleep(args.scan_interval)
                 continue
@@ -801,9 +858,18 @@ async def play_one_game(settings: Settings, args, client: LcuClient,
             gate.note_offers(True, now)      # 牌面已在屏幕上 → 继续跟踪刷新
             published_stage = session.stage
             flow.set_state(AugmentFlowState.STABLE)
-            update = flow.register_offers(session.stage, offer.signature)
-            session.apply_slot_update(update.offer_version, update.changed_slots,
-                                      update.offers)
+            if (augment_round == 0 or round_boundary_pending
+                    or flow.stage != session.stage):
+                augment_round += 1
+                round_boundary_pending = False
+            update = flow.register_offers(
+                session.stage, offer.signature, augment_round=augment_round)
+            if update.is_new_round:
+                session.begin_round(update.stage, update.offers,
+                                    augment_round=augment_round)
+            else:
+                session.apply_slot_update(update.offer_version, update.changed_slots,
+                                          update.offers)
             flow.set_state(AugmentFlowState.QUERYING)
 
             for index, reading in enumerate(offer.readings):
@@ -819,18 +885,35 @@ async def play_one_game(settings: Settings, args, client: LcuClient,
             else:
                 slots = update.changed_slots or range(len(offer.readings))
 
+            stats_started = time.perf_counter()
+            stats_source = "none"
             for slot in slots:
                 if slot >= len(offer.readings):
                     continue
                 reading = offer.readings[slot]
                 # 必须带当前 Session 的英雄（final 优先），绝不按"只查海克斯"取数
-                stats = provider.query_augment_stats(
-                    session.active_champion_id, reading.augment_id).stats
+                result = provider.query_augment_stats(
+                    session.active_champion_id, reading.augment_id)
+                stats = result.stats
+                if stats_source == "none":
+                    stats_source = result.source
                 slot_offers[slot] = AugmentOfferLike(reading, stats)
+            stats_lookup_ms = (time.perf_counter() - stats_started) * 1000.0
 
+            recommend_started = time.perf_counter()
             payload, recommended = build_offer_payload(
                 slot_offers, pending_slots,
                 stats_state=provider.stats_state(session.active_champion_id))
+            recommend_ms = (time.perf_counter() - recommend_started) * 1000.0
+
+            if update.is_new_round:
+                trigger = "INITIAL" if not seen_stages else "NEXT_STAGE"
+                if session.stage is not None:
+                    seen_stages.add(session.stage)
+            elif update.changed_slots:
+                trigger = "SLOT_CHANGE"
+            else:
+                trigger = "SIGNATURE_UPDATE"
 
             augment_log.info("Stage=%s OfferVersion=%s SlotRerolled=%s",
                              update.stage, update.offer_version, update.changed_slots)
@@ -838,6 +921,24 @@ async def play_one_game(settings: Settings, args, client: LcuClient,
                           recommended, recommendation_reason(), sorted(slots))
             print_offers(payload, update)
             overlay_started = time.perf_counter()
+            trace = HUB.perf.new_trace(
+                session_id=session_id, stage=session.stage,
+                augment_round=augment_round,
+                offer_version=update.offer_version, trigger=trigger,
+                started_at_perf=scan_started)
+            trace.screenshot_ms = metrics.screenshot_ms
+            trace.offer_detect_ms = metrics.detect_ms
+            trace.ocr_ms = metrics.ocr_ms
+            trace.stabilize_ms = metrics.stabilize_ms
+            trace.stats_lookup_ms = stats_lookup_ms
+            trace.stats_source = stats_source
+            trace.recommend_ms = recommend_ms
+            trace.ocr_calls = metrics.ocr_calls
+            trace.slot_ocr_calls = list(metrics.slot_ocr_calls)
+            trace.total_ms = (metrics.total_ms + metrics.stabilize_ms
+                              + stats_lookup_ms + recommend_ms)
+            # 先进入历史记录，Qt 主线程收到 offers 信号时即可补写真实可见延迟。
+            HUB.perf.record_trace(trace)
             try:
                 publish_offers(
                     overlay, payload, pending_slots, recommended,
@@ -845,15 +946,25 @@ async def play_one_game(settings: Settings, args, client: LcuClient,
                     changed_slots=list(update.changed_slots),
                     rerolled_slots=sorted(flow.rerolled_slots),
                     level=session.level, stage=session.stage,
+                    augment_round=augment_round,
                     ocr_calls=reader.ocr_calls,
                     cache_status=provider.cache_status(
-                        session.active_champion_id).value)
+                        session.active_champion_id).value,
+                    perf_trace=trace,
+                    offers_updated_at=time.perf_counter())
                 overlay_log.info("show %d cards (cache=%s)",
                                  len(payload),
                                  provider.cache_status(session.active_champion_id).value)
             except Exception as exc:  # noqa: BLE001
                 overlay_log.warning("更新失败: %s", exc)
-            HUB.perf.record("overlay", time.perf_counter() - overlay_started)
+            trace.overlay_update_ms = (time.perf_counter() - overlay_started) * 1000.0
+            trace.total_ms = (metrics.total_ms + metrics.stabilize_ms
+                              + stats_lookup_ms + recommend_ms
+                              + trace.overlay_update_ms)
+            HUB.perf.record_trace(trace)
+            HUB.update(perf_trace=trace)
+            HUB.perf.record("overlay", trace.overlay_update_ms / 1000.0)
+            perf_log.info("%s", trace.describe())
             flow.set_state(AugmentFlowState.SHOWING)
             await pump_qt()
             await _sleep(args.scan_interval)
@@ -879,6 +990,9 @@ async def play_one_game(settings: Settings, args, client: LcuClient,
 async def resident(settings: Settings, args, control: "Control | None" = None) -> int:
     """常驻：等待客户端 -> 一局接一局，绝不因为一局结束而退出。"""
     control = control or Control()
+    from src.ocr.engine import start_ocr_prewarm
+
+    start_ocr_prewarm()
     _STOP[0] = control.stop
     overlay = make_overlay(settings, enabled=not args.no_overlay)
     provider = OpggProvider(stats_repository=args.stats_repository, settings=settings)
@@ -950,6 +1064,9 @@ def run(settings: Settings, args) -> int:
             return 0
 
     async def _single() -> int:
+        from src.ocr.engine import start_ocr_prewarm
+
+        start_ocr_prewarm()
         overlay = make_overlay(settings, enabled=not args.no_overlay)
         provider = OpggProvider(stats_repository=args.stats_repository, settings=settings)
         try:

@@ -53,9 +53,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="选人阶段轮询候选英雄的间隔秒数（换英雄检测）")
     parser.add_argument("--scan-interval", type=float, default=0.25,
                         help="三卡 OCR 扫描间隔")
-    parser.add_argument("--level-poll-interval", type=float, default=1.0,
+    parser.add_argument("--level-poll-interval", type=float, default=0.5,
                         help="对局中 Live Client 等级轮询间隔（秒）")
-    parser.add_argument("--watchdog-interval", type=float, default=1.0,
+    parser.add_argument("--watchdog-interval", type=float, default=0.35,
                         help="海克斯扫描窗口外的低频检测间隔（秒）")
     parser.add_argument("--wait-game", type=float, default=180.0, metavar="MINUTES",
                         help="等待对局出现的分钟数")

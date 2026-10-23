@@ -7,8 +7,9 @@ from __future__ import annotations
 
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from src.utils.logger import get_logger, get_tagged
 
@@ -23,12 +24,75 @@ class PerfStats:
     ocr_ms: float = 0.0
     opgg_ms: float = 0.0
     overlay_ms: float = 0.0
+    screenshot_ms: float = 0.0
+    offer_detect_ms: float = 0.0
+    stabilize_ms: float = 0.0
+    stats_lookup_ms: float = 0.0
+    recommend_ms: float = 0.0
+    overlay_update_ms: float = 0.0
+    total_ms: float = 0.0
+    overlay_visible_ms: float = 0.0
     samples: int = 0
 
     def describe(self) -> str:
-        return ("CPU: %.1f%% Memory: %.1f MB OCR: %.0f ms OP.GG: %.0f ms Overlay: %.1f ms"
+        return ("CPU: %.1f%% Memory: %.1f MB OCR: %.0f ms OP.GG: %.0f ms "
+                "Overlay: %.1f ms Total: %.0f ms"
                 % (self.cpu_percent, self.memory_mb, self.ocr_ms,
-                   self.opgg_ms, self.overlay_ms))
+                   self.opgg_ms, self.overlay_ms, self.total_ms))
+
+
+@dataclass
+class PerfTrace:
+    """一次"有效牌面 -> 浮层发布"的毫秒级分段记录。"""
+
+    trace_id: int = 0
+    session_id: int = 0
+    stage: Optional[int] = None
+    augment_round: int = 0
+    offer_version: int = 0
+    trigger: str = ""
+    offer_detect_ms: float = 0.0
+    screenshot_ms: float = 0.0
+    ocr_ms: float = 0.0
+    stabilize_ms: float = 0.0
+    stats_lookup_ms: float = 0.0
+    stats_source: str = "none"
+    recommend_ms: float = 0.0
+    overlay_update_ms: float = 0.0
+    overlay_visible_ms: float = 0.0
+    total_ms: float = 0.0
+    ocr_calls: int = 0
+    slot_ocr_calls: list[int] = field(default_factory=lambda: [0, 0, 0])
+    started_at_perf: float = 0.0
+    recorded_at: float = 0.0
+
+    def describe(self) -> str:
+        """固定日志格式；可由日志工具直接采集。"""
+        return (
+            "PERF trace=%s session=%s stage=%s round=%s offer_version=%s trigger=%s "
+            "offer_detect_ms=%.1f screenshot_ms=%.1f ocr_ms=%.1f "
+            "stabilize_ms=%.1f stats_lookup_ms=%.2f source=%s "
+            "recommend_ms=%.2f overlay_update_ms=%.2f total_ms=%.1f "
+            "ocr_calls=%s slots=%s"
+            % (self.trace_id, self.session_id, self.stage, self.augment_round,
+               self.offer_version, self.trigger, self.offer_detect_ms,
+               self.screenshot_ms,
+               self.ocr_ms, self.stabilize_ms, self.stats_lookup_ms,
+               self.stats_source, self.recommend_ms, self.overlay_update_ms,
+               self.total_ms, self.ocr_calls, self.slot_ocr_calls)
+        )
+
+
+@dataclass(frozen=True)
+class LatencySummary:
+    count: int = 0
+    p50_ms: float = 0.0
+    p95_ms: float = 0.0
+    max_ms: float = 0.0
+
+    def describe(self) -> str:
+        return ("n=%d P50=%.1f ms P95=%.1f ms max=%.1f ms"
+                % (self.count, self.p50_ms, self.p95_ms, self.max_ms))
 
 
 class PerfMonitor:
@@ -40,6 +104,8 @@ class PerfMonitor:
         self._process = None
         self._thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
+        self._trace_seq = 0
+        self._trace_history: deque[PerfTrace] = deque(maxlen=500)
         try:
             import psutil
 
@@ -90,6 +156,67 @@ class PerfMonitor:
         elif name == "overlay":
             self.stats.overlay_ms = value
 
+    def new_trace(self, *, session_id: int = 0, stage: Optional[int] = None,
+                  augment_round: int = 0, offer_version: int = 0,
+                  trigger: str = "",
+                  started_at_perf: Optional[float] = None) -> PerfTrace:
+        """创建一条待填充的性能记录。"""
+        self._trace_seq += 1
+        return PerfTrace(
+            trace_id=self._trace_seq,
+            session_id=session_id,
+            stage=stage,
+            augment_round=augment_round,
+            offer_version=offer_version,
+            trigger=trigger,
+            started_at_perf=(time.perf_counter()
+                             if started_at_perf is None else started_at_perf),
+        )
+
+    def record_trace(self, trace: PerfTrace) -> PerfTrace:
+        """保存并更新最新分段指标；同一 trace 可多次补写。"""
+        trace.recorded_at = time.perf_counter()
+        if not any(item is trace for item in self._trace_history):
+            self._trace_history.append(trace)
+        self.stats.screenshot_ms = trace.screenshot_ms
+        self.stats.offer_detect_ms = trace.offer_detect_ms
+        self.stats.ocr_ms = trace.ocr_ms
+        self.stats.stabilize_ms = trace.stabilize_ms
+        self.stats.stats_lookup_ms = trace.stats_lookup_ms
+        self.stats.opgg_ms = trace.stats_lookup_ms
+        self.stats.recommend_ms = trace.recommend_ms
+        self.stats.overlay_update_ms = trace.overlay_update_ms
+        self.stats.overlay_ms = trace.overlay_update_ms
+        self.stats.total_ms = trace.total_ms
+        if trace.overlay_visible_ms > 0:
+            self.stats.overlay_visible_ms = trace.overlay_visible_ms
+        return trace
+
+    def mark_overlay_visible(self, trace_id: int,
+                             visible_at_perf: Optional[float] = None) -> float:
+        """记录主线程真正应用浮层内容时的端到端耗时。"""
+        moment = time.perf_counter() if visible_at_perf is None else visible_at_perf
+        for trace in reversed(self._trace_history):
+            if trace.trace_id != trace_id:
+                continue
+            trace.overlay_visible_ms = max(
+                0.0, (moment - trace.started_at_perf) * 1000.0)
+            self.stats.overlay_visible_ms = trace.overlay_visible_ms
+            return trace.overlay_visible_ms
+        return 0.0
+
+    def latency_summary(self, trigger: Optional[str] = None) -> LatencySummary:
+        """按触发类型汇总 total_ms；用于开发基准与 Debug 页面。"""
+        values = [trace.total_ms for trace in self._trace_history
+                  if trace.total_ms > 0
+                  and (trigger is None or trace.trigger == trigger)]
+        if not values:
+            return LatencySummary()
+        ordered = sorted(values)
+        p50 = ordered[int(round((len(ordered) - 1) * 0.50))]
+        p95 = ordered[int(round((len(ordered) - 1) * 0.95))]
+        return LatencySummary(len(ordered), p50, p95, ordered[-1])
+
     def log(self) -> None:
         perf_log.debug("%s", self.stats.describe())
 
@@ -118,6 +245,7 @@ class AppSnapshot:
     final_champion_name: Optional[str] = None
     level: Optional[int] = None
     stage: Optional[int] = None
+    augment_round: int = 0
 
     offers: list = field(default_factory=list)
     offer_version: int = 0
@@ -148,6 +276,8 @@ class AppSnapshot:
     status_message: str = ""
 
     perf: PerfStats = field(default_factory=PerfStats)
+    perf_trace: Optional[PerfTrace] = None
+    offers_updated_at: float = 0.0
     updated_at: float = 0.0
 
 
@@ -158,15 +288,41 @@ class StateHub:
         self._lock = threading.Lock()
         self._snapshot = AppSnapshot()
         self.perf = PerfMonitor()
+        self._listeners: dict[int, Callable[[set[str]], None]] = {}
+        self._listener_seq = 0
+
+    def subscribe(self, listener: Callable[[set[str]], None]) -> int:
+        """订阅字段变化；回调可能来自引擎线程，Qt 调用方必须转到主线程。"""
+        with self._lock:
+            self._listener_seq += 1
+            token = self._listener_seq
+            self._listeners[token] = listener
+            return token
+
+    def unsubscribe(self, token: Optional[int]) -> None:
+        if token is None:
+            return
+        with self._lock:
+            self._listeners.pop(token, None)
 
     def update(self, **fields: Any) -> AppSnapshot:
         with self._lock:
+            changed: set[str] = set()
             for key, value in fields.items():
                 if hasattr(self._snapshot, key):
                     setattr(self._snapshot, key, value)
+                    changed.add(key)
             self._snapshot.perf = self.perf.stats
             self._snapshot.updated_at = time.time()
-            return self._snapshot
+            snapshot = self._snapshot
+            listeners = tuple(self._listeners.values())
+        # 回调必须在锁外执行；回调内部可以安全地再次读取 snapshot()。
+        for listener in listeners:
+            try:
+                listener(changed)
+            except Exception as exc:  # noqa: BLE001 - 订阅者不能影响状态发布
+                logger.debug("状态订阅回调失败: %s", exc)
+        return snapshot
 
     def snapshot(self) -> AppSnapshot:
         with self._lock:
@@ -181,4 +337,5 @@ class StateHub:
 HUB = StateHub()
 
 
-__all__ = ["AppSnapshot", "PerfStats", "PerfMonitor", "StateHub", "HUB"]
+__all__ = ["AppSnapshot", "PerfStats", "PerfTrace", "LatencySummary",
+           "PerfMonitor", "StateHub", "HUB"]

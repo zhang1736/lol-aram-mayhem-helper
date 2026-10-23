@@ -39,15 +39,18 @@ class OfferUpdate:
     """一次牌面更新结果。"""
 
     stage: Optional[int]
+    augment_round: int
     offer_version: int
     changed_slots: list[int] = field(default_factory=list)
     rerolled_slots: list[int] = field(default_factory=list)
     offers: list[Optional[int]] = field(default_factory=list)
     is_new_stage: bool = False
+    is_new_round: bool = False
 
     def describe(self) -> str:
-        return ("Stage=%s OfferVersion=%s SlotRerolled=%s Offers=%s"
-                % (self.stage, self.offer_version, self.changed_slots, self.offers))
+        return ("Round=%s Stage=%s OfferVersion=%s SlotRerolled=%s Offers=%s"
+                % (self.augment_round, self.stage, self.offer_version,
+                   self.changed_slots, self.offers))
 
 
 class AugmentFlow:
@@ -56,6 +59,7 @@ class AugmentFlow:
     def __init__(self) -> None:
         self.state = AugmentFlowState.WAIT_AUGMENT
         self.stage: Optional[int] = None
+        self.augment_round: int = 0
         self.offer_version: int = 0
         self.last_signature: Optional[tuple] = None
         self._last_transition_at: dict[tuple[str, str], float] = {}
@@ -83,7 +87,8 @@ class AugmentFlow:
 
     # -- 牌面更新 -----------------------------------------------------------
     def register_offers(self, stage: Optional[int],
-                        signature: Sequence) -> OfferUpdate:
+                        signature: Sequence,
+                        augment_round: Optional[int] = None) -> OfferUpdate:
         """记录一次确认的牌面。
 
         规则：
@@ -93,10 +98,19 @@ class AugmentFlow:
         """
         sig = tuple(signature)
         changed: list[int] = []
+        round_changed = (augment_round is not None
+                         and augment_round != self.augment_round)
         is_new_stage = stage != self.stage
+        is_new_round = is_new_stage or round_changed
 
-        if is_new_stage:
+        if is_new_round:
             self.stage = stage
+            if augment_round is not None:
+                self.augment_round = int(augment_round)
+            elif self.augment_round <= 0:
+                self.augment_round = 1
+            else:
+                self.augment_round += 1
             self.offer_version = 1
             self.rerolled_slots = set()
             self.slot_reroll_counts = {}
@@ -121,11 +135,13 @@ class AugmentFlow:
 
         update = OfferUpdate(
             stage=self.stage,
+            augment_round=self.augment_round,
             offer_version=self.offer_version,
             changed_slots=list(changed),
             rerolled_slots=sorted(self.rerolled_slots),
             offers=[sig[i] if i < len(sig) else None for i in range(SLOT_COUNT)],
             is_new_stage=is_new_stage,
+            is_new_round=is_new_round,
         )
         logger.info("%s", update.describe())
         return update
@@ -138,6 +154,7 @@ class AugmentFlow:
     def reset(self) -> None:
         self.state = AugmentFlowState.WAIT_AUGMENT
         self.stage = None
+        self.augment_round = 0
         self.offer_version = 0
         self.last_signature = None
         self.changed_slots = []

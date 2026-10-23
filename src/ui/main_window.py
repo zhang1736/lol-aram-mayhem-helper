@@ -125,7 +125,8 @@ if PYSIDE6_AVAILABLE:  # pragma: no cover
             self.client_value.setText("● 已连接" if snap.client_connected else "○ 未连接")
             self.phase_value.setText(gameflow_text(snap.gameflow))
             self.champion_value.setText(hero_text(snap.champion_name, snap.champion_alias))
-            self.stage_value.setText(stage_text(snap.stage, snap.level))
+            self.stage_value.setText(stage_text(
+                snap.stage, snap.level, snap.augment_round))
             self.hero_scope_value.setText(hero_scope_text(snap.data_region, snap.data_tier))
             self.augment_scope_value.setText(snap.augment_scope)
             self.patch_value.setText(patch_text(snap.data_patch))

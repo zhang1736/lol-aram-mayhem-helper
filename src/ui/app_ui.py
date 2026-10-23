@@ -30,6 +30,7 @@ logger = get_logger(__name__)
 app_log = get_tagged("client", "app.lifecycle")
 overlay_log = get_tagged("overlay")
 client_log = get_tagged("client")
+perf_log = get_tagged("flow", "perf")
 
 try:  # pragma: no cover
     from PySide6 import QtCore, QtWidgets
@@ -71,6 +72,11 @@ def _open_logs() -> None:
 
 if PYSIDE6_AVAILABLE:  # pragma: no cover
 
+    class _HubSignalBridge(QtCore.QObject):
+        """把引擎线程的状态发布安全地排队到 Qt 主线程。"""
+
+        changed = QtCore.Signal()
+
     class AppController:
         """统一持有所有需要清理的资源，并提供唯一的 shutdown()。"""
 
@@ -93,11 +99,22 @@ if PYSIDE6_AVAILABLE:  # pragma: no cover
             self._timers: list = []
             self._overlay_user_visible = True
             self._last_overlay_payload: list = []
+            self._last_applied_trace_id = 0
             #: HIDDEN / PREVIEW / LIVE —— 预览期间必须屏蔽真实游戏的清理逻辑
             self.overlay_mode: OverlayMode = OverlayMode.HIDDEN
             self._preview_timer = None
+            #: HUB -> Qt 主线程的即时通知；保留 1s 定时器作为兜底。
+            self._hub_bridge = _HubSignalBridge()
+            self._hub_bridge.changed.connect(
+                self.sync_overlay, QtCore.Qt.QueuedConnection)
+            self._hub_listener = HUB.subscribe(self._notify_overlay_change)
             #: 更新控制器（启动自动检查 / 手动检查 / 下载安装）
             self.update_controller = None
+
+        def _notify_overlay_change(self, changed_fields: set[str]) -> None:
+            """可能由引擎线程调用；Signal 会排队到主线程执行。"""
+            if "offers" in changed_fields or "overlay_visible" in changed_fields:
+                self._hub_bridge.changed.emit()
 
         # -- 生命周期 -------------------------------------------------------
         @property
@@ -153,6 +170,11 @@ if PYSIDE6_AVAILABLE:  # pragma: no cover
                 logger.exception("停止后台任务失败")
 
             # 2) 停止定时器
+            try:
+                HUB.unsubscribe(self._hub_listener)
+                self._hub_listener = None
+            except Exception:  # noqa: BLE001
+                logger.exception("取消状态订阅失败")
             if self._preview_timer is not None:
                 try:
                     self._preview_timer.stop()
@@ -289,6 +311,14 @@ if PYSIDE6_AVAILABLE:  # pragma: no cover
                 return
 
             self.overlay_mode = OverlayMode.LIVE if payload else OverlayMode.HIDDEN
+            trace = snap.perf_trace
+            if (trace is not None and snap.offers_updated_at
+                    and trace.trace_id != self._last_applied_trace_id):
+                visible_ms = HUB.perf.mark_overlay_visible(trace.trace_id)
+                if visible_ms > 0:
+                    self._last_applied_trace_id = trace.trace_id
+                    perf_log.info("%s overlay_visible_ms=%.1f",
+                                  trace.describe(), visible_ms)
             if payload == self._last_overlay_payload:
                 return
             self._last_overlay_payload = payload
@@ -321,10 +351,11 @@ def run_gui(settings: Settings, args) -> int:
 
         return live.run(settings, args)
 
+    # QObject（包括 HUB -> Qt 的信号桥）必须在 QApplication 之后创建。
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv)
     controller = AppController(settings, args)
     instance = controller.instance
     if not instance.acquire():
-        app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv)
         QtWidgets.QMessageBox.information(None, "LOL 海克斯助手", ALREADY_RUNNING_TEXT)
         return 0
 
@@ -338,9 +369,6 @@ def run_gui(settings: Settings, args) -> int:
     from src.ui.settings_dialog import SettingsDialog
     from src.ui.tray import TrayIcon
 
-    controller.start_engine()
-
-    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv)
     controller.app = app
     app.setQuitOnLastWindowClosed(False)
 
@@ -448,7 +476,8 @@ def run_gui(settings: Settings, args) -> int:
     # 主线程定时器：把 HUB 状态同步到 Overlay
     sync_timer = QtCore.QTimer()
     sync_timer.timeout.connect(controller.sync_overlay)
-    sync_timer.start(200)
+    # 正常路径由 HUB 订阅 + Qt 队列信号即时唤醒；此定时器仅作异常兜底。
+    sync_timer.start(1000)
     controller._timers.append(sync_timer)
 
     # 如果设置里启用了 Overlay，启动时就创建（海克斯出现前保持空白）
@@ -463,6 +492,7 @@ def run_gui(settings: Settings, args) -> int:
                data_region=settings.data.region,
                data_tier=settings.data.tier,
                overlay_enabled=settings.overlay.enabled)
+    controller.start_engine()
     client_log.info("GUI 启动（托盘常驻），日志目录: %s", paths.user_data_dir())
     app_log.info("[APP] GUI ready")
     # 启动后异步检查更新（不阻塞 LCU/OCR/浮层；UI 已就绪）

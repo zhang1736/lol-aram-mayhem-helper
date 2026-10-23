@@ -1,7 +1,9 @@
 """单局会话状态。
 
 术语（ARAM: Mayhem 实机确认）：
-    stage        第几次海克斯（1~4，对应 Lv.3/7/11/15）
+    stage        等级阶段（1~4，对应 Lv.3/7/11/15）
+    augment_round 实际第几次海克斯。可由同等级连续两次选取或 KDA 额外轮次得到，
+                  因此可以大于 4，不能继续用等级表限制。
     offerVersion 当前牌面的版本号；每次有卡槽被刷新就 +1
                  （以前的 rollIndex 已改名，避免与"整组刷新"混淆）
     changedSlots 本次变化（被刷新）的卡槽下标，0 基
@@ -66,6 +68,8 @@ class GameSession:
     final_champion_name: Optional[str] = None
 
     stage: Optional[int] = None
+    #: 本局实际出现的第几次海克斯；不依赖等级，支持 5 轮以上。
+    augment_round: int = 0
     level: Optional[int] = None
 
     #: 牌面版本号（原 rollIndex）
@@ -133,11 +137,16 @@ class GameSession:
                         level, stage, AUGMENT_STAGES.get(stage))
 
     # -- 牌面 ---------------------------------------------------------------
-    def begin_round(self, stage: int, offers: Iterable[int]) -> None:
+    def begin_round(self, stage: int, offers: Iterable[int],
+                    augment_round: Optional[int] = None) -> None:
         """进入新一次海克斯选择：offerVersion 归 1，清空槽位统计。"""
         self._archive_current_offers()
         self.stage = stage
-        self.level = AUGMENT_STAGES.get(stage)
+        self.augment_round = (self.augment_round + 1
+                              if augment_round is None else int(augment_round))
+        expected_level = AUGMENT_STAGES.get(stage)
+        if expected_level is not None and (self.level is None or self.level < expected_level):
+            self.level = expected_level
         self.offer_version = 1
         self.current_offers = list(offers)
         self.changed_slots = []
@@ -174,6 +183,7 @@ class GameSession:
         self.final_champion_alias = None
         self.final_champion_name = None
         self.stage = None
+        self.augment_round = 0
         self.level = None
         self.offer_version = 0
         self.current_offers = []
@@ -185,7 +195,8 @@ class GameSession:
 
     @property
     def is_empty(self) -> bool:
-        return self.champion_id is None and not self.current_offers and self.stage is None
+        return (self.champion_id is None and not self.current_offers
+                and self.stage is None and self.augment_round == 0)
 
 
 __all__ = ["GameSession", "AUGMENT_STAGES", "stage_from_level", "SLOT_COUNT"]

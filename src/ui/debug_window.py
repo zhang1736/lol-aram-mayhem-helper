@@ -58,6 +58,7 @@ if PYSIDE6_AVAILABLE:  # pragma: no cover
                 "  Final     : %s" % (snap.final_champion_id or "-"),
                 "  Level     : %s" % (snap.level if snap.level is not None else "-"),
                 "  Stage     : %s" % (snap.stage if snap.stage is not None else "-"),
+                "  AugRound  : %s" % snap.augment_round,
                 "",
                 "== OCR ==",
                 "  scan latency: %.0f ms" % snap.ocr_latency_ms,
@@ -83,6 +84,9 @@ if PYSIDE6_AVAILABLE:  # pragma: no cover
                 "",
                 "== Perf ==",
                 "  %s" % snap.perf.describe(),
+                "  trace        : %s" % (
+                    snap.perf_trace.describe() if snap.perf_trace else "-"),
+                "  overlay show : %.1f ms" % snap.perf.overlay_visible_ms,
             ]))
 
 else:  # pragma: no cover

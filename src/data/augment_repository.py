@@ -1,8 +1,9 @@
 """腾讯 KIWI 海克斯字典仓库。
 
-数据来源（Day 3 实测）：
+数据来源：
     https://game.gtimg.cn/images/lol/act/img/js/kiwi/kiwi_augments.json
-    原始响应保存到 data/kiwi_augments.json，不做任何修改。
+    data/kiwi_augments.json 保存腾讯最新条目，并保留已被腾讯下架但历史版本
+    仍可能引用的旧 ID。使用 tools/update_kiwi_dictionary.py 可安全合并更新。
 
 字段：augmentID / name_en / name_cn / mode / level / desc / tooltip / large_Icon / small_Icon
     level : kSilver / kGold / kPrismatic
@@ -18,6 +19,7 @@
 from __future__ import annotations
 
 import json
+from collections import OrderedDict
 from pathlib import Path
 from typing import Iterable, Optional
 
@@ -75,6 +77,7 @@ class AugmentRepository:
 
     def __init__(self, raw_path: str | Path | None = None,
                  mode: str = MAYHEM_MODE) -> None:
+        self._merge_bundled = raw_path is None
         self.raw_path = Path(raw_path) if raw_path else default_raw_path()
         self.mode = mode
         self.all_items: list[AugmentInfo] = []
@@ -93,10 +96,33 @@ class AugmentRepository:
             self.loaded = True
             return self
 
-        with open(self.raw_path, "r", encoding="utf-8") as fh:
-            payload = json.load(fh)
+        payload = self._read_payload(self.raw_path)
         if not isinstance(payload, list):
             raise ValueError("kiwi_augments.json 根节点应为数组")
+
+        # 正式安装可能保留旧版迁移到用户目录的字典。若只读它，新补丁新增的
+        # 海克斯会永久无法匹配。合并时让随程序发布的字典覆盖同 ID 字段，
+        # 同时保留用户文件里额外的 ID（可作为未来补丁的前向补充）。
+        if self._merge_bundled:
+            bundled_path = paths.bundled_augment_dict_path()
+            if bundled_path.exists() and bundled_path.resolve() != self.raw_path.resolve():
+                bundled = self._read_payload(bundled_path)
+                if isinstance(bundled, list):
+                    user_count = len(payload)
+                    merged: OrderedDict[int, dict] = OrderedDict()
+                    for row in payload:
+                        try:
+                            merged[int(row["augmentID"])] = row
+                        except (KeyError, TypeError, ValueError):
+                            continue
+                    for row in bundled:
+                        try:
+                            merged[int(row["augmentID"])] = row
+                        except (KeyError, TypeError, ValueError):
+                            continue
+                    payload = [merged[augment_id] for augment_id in sorted(merged)]
+                    logger.info("合并用户字典与内置字典: 用户 %d + 内置 %d -> %d 条",
+                                user_count, len(bundled), len(payload))
 
         self.all_items = parse_raw_dict(payload)
         self.items = [item for item in self.all_items if item.in_mode(self.mode)]
@@ -105,6 +131,11 @@ class AugmentRepository:
         logger.info("海克斯字典载入: 原始 %d 条, %s 有效 %d 条 (%s)",
                     len(self.all_items), self.mode, len(self.items), self.raw_path.name)
         return self
+
+    @staticmethod
+    def _read_payload(path: Path) -> list[dict]:
+        with open(path, "r", encoding="utf-8") as fh:
+            return json.load(fh)
 
     # -- 查询 ---------------------------------------------------------------
     def get(self, augment_id: int) -> Optional[AugmentInfo]:

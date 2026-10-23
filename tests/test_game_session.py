@@ -66,6 +66,32 @@ def test_second_stage_resets_offer_version_and_slots() -> None:
     assert session.rerolled_slots == set()
 
 
+def test_two_augment_rounds_at_same_level_keep_distinct_round_id() -> None:
+    """死亡后同等级连续两次选取必须得到 Round 1 / Round 2。"""
+    session = GameSession()
+    session.set_level(11)
+    session.begin_round(stage=3, offers=[1, 2, 3], augment_round=1)
+    session.apply_slot_update(2, [1], [1, 9, 3])
+    session.begin_round(stage=3, offers=[30, 31, 32], augment_round=2)
+
+    assert session.level == 11
+    assert session.stage == 3
+    assert session.augment_round == 2
+    assert session.offer_version == 1
+    assert session.rerolled_slots == set()
+
+
+def test_kda_bonus_round_can_be_fifth_without_level_mapping() -> None:
+    session = GameSession()
+    session.set_level(18)
+    session.begin_round(stage=4, offers=[1, 2, 3], augment_round=4)
+    session.begin_round(stage=4, offers=[10, 11, 12], augment_round=5)
+
+    assert session.level == 18
+    assert session.stage == 4
+    assert session.augment_round == 5
+
+
 def test_seen_augments_accumulates_across_rerolls() -> None:
     session = GameSession()
     session.begin_round(stage=1, offers=[1, 2, 3])
@@ -82,6 +108,7 @@ def test_reset_clears_everything() -> None:
     session.reset()
     assert session.is_empty
     assert session.stage is None
+    assert session.augment_round == 0
     assert session.offer_version == 0
     assert session.rerolled_slots == set()
     assert session.seen_augments == set()

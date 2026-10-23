@@ -113,6 +113,33 @@ def test_new_stage_resets_version_and_rerolls() -> None:
     assert flow.slot_reroll_counts == {}
 
 
+def test_second_round_same_stage_resets_version_and_rerolls() -> None:
+    """同等级第二轮的 stage 相同，但 Round 变化必须视为新一轮。"""
+    flow = AugmentFlow()
+    first = flow.register_offers(1, (1, 2, 3), augment_round=1)
+    assert first.augment_round == 1
+    flow.register_offers(1, (1, 9, 3), augment_round=1)
+    second = flow.register_offers(
+        1, (30, 31, 32), augment_round=2)
+    assert second.is_new_round is True
+    assert second.is_new_stage is False
+    assert second.augment_round == 2
+    assert second.offer_version == 1
+    assert flow.rerolled_slots == set()
+
+
+def test_fifth_kda_round_is_supported() -> None:
+    flow = AugmentFlow()
+    for round_id in range(1, 6):
+        update = flow.register_offers(
+            4 if round_id >= 4 else round_id,
+            (round_id * 10, round_id * 10 + 1, round_id * 10 + 2),
+            augment_round=round_id)
+    assert update.augment_round == 5
+    assert update.stage == 4
+    assert update.offer_version == 1
+
+
 def test_slot_reroll_counts_tracked() -> None:
     flow = AugmentFlow()
     flow.register_offers(1, (1, 2, 3))
@@ -128,6 +155,7 @@ def test_offer_update_describe_format() -> None:
     flow = AugmentFlow()
     update = flow.register_offers(2, (1029, 2137, 1211))
     text = update.describe()
+    assert "Round=" in text
     assert "Stage=2" in text
     assert "OfferVersion=1" in text
     assert "SlotRerolled=[]" in text
@@ -141,4 +169,5 @@ def test_reset_clears_tracking() -> None:
     flow.reset()
     assert flow.offer_version == 0
     assert flow.stage is None
+    assert flow.augment_round == 0
     assert flow.rerolled_slots == set()

@@ -187,6 +187,7 @@ def test_stage_display_is_user_friendly() -> None:
     assert texts.stage_text(None, None) == "-"
     assert texts.stage_text(1, 4) == "第 1 次海克斯 · Lv.4"
     assert texts.stage_text(2, 7) == "第 2 次海克斯 · Lv.7"
+    assert texts.stage_text(4, 18, 5) == "第 5 次海克斯 · Lv.18"
 
 
 def test_hero_display_prefers_chinese_name() -> None:

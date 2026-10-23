@@ -31,10 +31,11 @@ logger = get_tagged("ocr", "ocr.gate")
 
 #: 进入 stage 后的高频扫描窗口长度（§6）
 AUGMENT_SCAN_TIMEOUT = 10.0
-#: 窗口外的低频检测间隔（§12）
-WATCHDOG_INTERVAL = 1.0
+#: 窗口外的轻量检测间隔。只抓 1410x58 名称带并算哈希/亮度，不做 OCR；
+#: 0.35s 是为了让下一次海克斯界面在约一秒内被重新武装，同时保持低成本。
+WATCHDOG_INTERVAL = 0.35
 #: 画面静止多久 → 认为"可能是牌面 UI"（牌面是静态覆盖层）
-STABLE_ARM_SECONDS = 0.9
+STABLE_ARM_SECONDS = 0.35
 #: 相对近期平均亮度跳变多少 → 认为"牌面 UI 出现"（0~255）
 BRIGHTNESS_JUMP = 25.0
 #: 两次重新武装之间的最小间隔，防止抖动
@@ -173,6 +174,10 @@ class AugmentScanGate:
         # 牌面收走（选完 / 界面消失）→ 本 stage 结束，回到低频 watchdog
         if self.stage_completed:
             self.close_window(moment, reason="OFFERS_GONE")
+            # 同等级可能出现第二次海克斯。清除本轮完成标记和旧冷却，
+            # 下一帧 watchdog 特征命中后可立即重新武装，不等待 2 秒。
+            self.stage_completed = False
+            self._last_arm_at = float("-inf")
 
     def note_game_end(self) -> None:
         """对局结束：彻底停止抓屏与 OCR。"""

@@ -93,6 +93,11 @@ def augment_dict_path() -> Path:
     return resource_path("data", "kiwi_augments.json")
 
 
+def bundled_augment_dict_path() -> Path:
+    """随程序发布的腾讯字典（不受用户旧缓存覆盖）。"""
+    return resource_dir() / "data" / "kiwi_augments.json"
+
+
 def augment_alias_path() -> Path:
     return resource_path("data", "augment_aliases.json")
 
@@ -120,5 +125,5 @@ __all__ = [
     "APP_DIR_NAME", "is_frozen", "project_root", "resource_dir", "user_data_dir",
     "ensure_user_subdirs", "user_config_path", "database_path", "log_path",
     "default_config_path", "resource_path", "augment_dict_path",
-    "augment_alias_path", "migrate_legacy_data",
+    "bundled_augment_dict_path", "augment_alias_path", "migrate_legacy_data",
 ]

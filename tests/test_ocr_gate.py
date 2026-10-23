@@ -217,7 +217,12 @@ def test_changed_slot_only_triggers_ocr() -> None:
 
     capture.set_slot(1, 3)                        # slot1 换成"战争交响乐"
     clock.advance(MIN_SLOT_OCR_INTERVAL + 0.01)   # 过了最小间隔
-    offer = reader.read_once()
+    pending = reader.read_once()
+    assert engine.calls == [], "新卡面必须先经过一帧稳定确认"
+    assert pending.pending_slots == [1]
+
+    clock.advance(reader.interval)
+    offer = reader.read_once()                    # 第二帧仍是新卡面 → 只 OCR slot1
 
     assert engine.calls == [1], "只允许 OCR 变化的 slot1"
     assert offer.signature == (1325, 1079, 1079)
@@ -227,7 +232,7 @@ def test_changed_slot_only_triggers_ocr() -> None:
 
 
 def test_slot_ocr_min_interval() -> None:
-    """像素一直变（动画）时，同一 slot 至少间隔 0.75s 才 OCR。"""
+    """像素一直变（动画）时不 OCR；新卡面连续两帧一致后才识别。"""
     clock = FakeClock()
     capture, engine, reader = _reader(clock)
     reader.read_once()
@@ -248,6 +253,10 @@ def test_slot_ocr_min_interval() -> None:
 
     capture.set_slot(1, 3)                        # 动画结束，最终停在"战争交响乐"
     clock.advance(MIN_SLOT_OCR_INTERVAL)          # 间隔到点 → 只 OCR 一次
+    reader.read_once()
+    assert engine.calls == [], "第一帧新卡面只建立候选基线"
+
+    clock.advance(0.25)
     offer = reader.read_once()
     assert engine.calls == [1]
     assert offer.signature == (1325, 1079, 1079)
@@ -263,6 +272,18 @@ def test_game_end_disables_ocr() -> None:
     assert gate.mode() is ScanMode.STOPPED
     assert gate.scan_window_active is False
     assert gate.observe(BandFeature(stable=True)) is False
+
+
+def test_offers_gone_rearms_immediately_for_same_stage_second_round() -> None:
+    """同一等级连续两轮时，上一轮消失后不能受 2 秒冷却阻塞。"""
+    clock = FakeClock(10.0)
+    gate = _gate(clock)
+    gate.update_stage(3)
+    gate.note_offers(True, clock.now)
+    gate.note_offers(False, clock.now)
+
+    assert gate.mode(clock.now) is ScanMode.FAST
+    assert gate.history[-1][1] == "SAFETY_REARM"
 
 
 # ------------------------------------------------------- 不会错过海克斯界面
