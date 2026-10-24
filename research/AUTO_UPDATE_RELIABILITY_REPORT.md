@@ -19,7 +19,7 @@ from_versions=[1.0.2]
 ```text
 asset=update-incremental-to-v1.0.3.zip
 type=incremental
-bytes=19,546,677
+bytes=19,547,290
 elapsed=3.75 s
 speed=5,084 KB/s
 ```
@@ -82,9 +82,9 @@ GUI ready
 最终包大小：
 
 ```text
-首次安装包  163,291,599 bytes
-完整更新包  163,301,791 bytes
-增量更新包   19,546,677 bytes
+首次安装包  163,292,212 bytes
+完整更新包  163,302,401 bytes
+增量更新包   19,547,290 bytes
 ```
 
 ## 测试
