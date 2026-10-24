@@ -26,7 +26,7 @@ import os
 import sys
 import time
 import zipfile
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -99,13 +99,17 @@ def full_operations(files: dict[str, dict], old_files: dict[str, dict]) -> list[
 
 
 def incremental_operations(files: dict[str, dict],
-                           old_sets: list[dict[str, dict]]) -> list[dict]:
+                           old_sets: list[dict[str, dict]],
+                           excluded: set[str] | None = None) -> list[dict]:
     """对多个旧版本做"并集 diff"，保证从任一旧版本升级都能得到新文件集。"""
+    excluded = {Path(p).as_posix().lower() for p in (excluded or set())}
     ops: list[dict] = []
     old_keys: set[str] = set()
     for old in old_sets:
         old_keys.update(old)
     for relative, meta in sorted(files.items()):
+        if relative.lower() in excluded:
+            continue
         changed = any((relative not in old) or (old[relative]["sha256"] != meta["sha256"])
                       for old in old_sets)
         if changed:
@@ -113,8 +117,48 @@ def incremental_operations(files: dict[str, dict],
             ops.append({"op": op, "path": relative, "size": meta["size"],
                         "sha256": meta["sha256"]})
     for relative in sorted(old_keys - set(files)):
+        if relative.lower() in excluded:
+            continue
         ops.append({"op": "delete", "path": relative})
     return ops
+
+
+def validate_app_layout(app_dir: Path) -> None:
+    """确认 app-dir 本身就是应用根目录，不能再带 dist 前缀。"""
+    app_dir = Path(app_dir)
+    for required in ("LOL海克斯助手.exe", "Updater.exe", "_internal"):
+        if not (app_dir / required).exists():
+            raise ValueError("应用目录缺少必要文件: %s" % required)
+    if app_dir.name.lower() == "dist":
+        raise ValueError("app-dir 不能直接指向 dist，应指向 dist/LOL海克斯助手")
+
+
+def validate_operation_paths(operations: list[dict]) -> None:
+    """拒绝把公共发布目录前缀写进增量目标路径。"""
+    bad_prefixes = ("dist/", "lol海克斯助手/", "dist/lol海克斯助手/")
+    for op in operations:
+        raw = str(op.get("path") or "").replace("\\", "/")
+        lowered = raw.lower()
+        if any(lowered.startswith(prefix) for prefix in bad_prefixes):
+            raise ValueError(
+                "更新包路径包含发布目录前缀，拒绝生成: %s" % raw)
+        if raw.startswith("/") or ".." in PurePosixPath(raw).parts:
+            raise ValueError("更新包路径不安全: %s" % raw)
+
+
+def build_installer_zip(app_dir: Path, target: Path) -> Path:
+    """生成首次安装 ZIP；只保留一个应用根目录。"""
+    app_dir = Path(app_dir)
+    validate_app_layout(app_dir)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED) as zf:
+        for root, dirs, names in os.walk(app_dir):
+            dirs.sort()
+            for name in sorted(names):
+                path = Path(root) / name
+                relative = path.relative_to(app_dir)
+                zf.write(path, (Path(app_dir.name) / relative).as_posix())
+    return target
 
 
 def write_manifest(out: Path, *, version: str, notes: list[str],
@@ -205,12 +249,20 @@ def main(argv=None) -> int:
                         help="GitHub Release 下载基地址（不给则只生成模板）")
     parser.add_argument("--min-version", default="")
     parser.add_argument("--repository", default=None, help="owner/repo")
+    parser.add_argument(
+        "--exclude-from-incremental", action="append", default=[],
+        help="不写入增量包的文件（相对 app-dir，可重复）；用于兼容旧 Updater")
     args = parser.parse_args(argv)
 
     version = str(parse_version(args.version))
     app_dir = args.app_dir.resolve()
     if not app_dir.is_dir():
         print("app-dir 不存在: %s" % app_dir)
+        return 2
+    try:
+        validate_app_layout(app_dir)
+    except ValueError as exc:
+        print(str(exc))
         return 2
     if len(args.previous) != len(args.from_version):
         print("--previous 与 --from-version 必须一一对应")
@@ -232,14 +284,19 @@ def main(argv=None) -> int:
 
     old_sets = [scan_app(p.resolve()) for p in args.previous]
     full_ops = full_operations(files, old_sets[0] if old_sets else {})
+    validate_operation_paths(full_ops)
     full_package = build_package(app_dir, out / ("update-full-v%s.zip" % version),
                                  version, update_type="full", operations=full_ops,
                                  from_versions=[])
+    installer_package = build_installer_zip(
+        app_dir, out / ("LOLHexHelper-v%s.zip" % version))
 
     incremental = None
     inc_ops: list[dict] = []
     if old_sets:
-        inc_ops = incremental_operations(files, old_sets)
+        inc_ops = incremental_operations(
+            files, old_sets, excluded=set(args.exclude_from_incremental))
+        validate_operation_paths(inc_ops)
         if inc_ops:
             incremental = build_package(
                 app_dir, out / ("update-incremental-to-v%s.zip" % version),
@@ -263,6 +320,8 @@ def main(argv=None) -> int:
     print("版本: v%s  文件数: %d" % (version, len(files)))
     print("完整包: %s (%.1f MB)" % (full_package.name,
                                     full_package.stat().st_size / 1024 / 1024))
+    print("安装包: %s (%.1f MB)" % (installer_package.name,
+                                    installer_package.stat().st_size / 1024 / 1024))
     if incremental is not None:
         print("增量包: %s (%.1f MB, %d 个操作)" %
               (incremental.name, incremental.stat().st_size / 1024 / 1024, len(inc_ops)))

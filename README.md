@@ -161,17 +161,19 @@ py -3.12 -m venv .venv
 & ".venv\Scripts\python.exe" -m src.lcu.diagnostic      # LCU 诊断
 & ".venv\Scripts\python.exe" -m pytest tests/ -v        # 测试
 
-# 打包
-& ".venv\Scripts\python.exe" -m PyInstaller packaging\LOL海克斯助手.spec --noconfirm
+# 打包（必须先构建 Updater，主程序会把它作为内嵌升级副本）
 & ".venv\Scripts\python.exe" -m PyInstaller packaging\updater.spec --noconfirm `
     --distpath dist_updater --workpath build_updater
+& ".venv\Scripts\python.exe" -m PyInstaller packaging\LOL海克斯助手.spec --noconfirm
 Copy-Item dist_updater\Updater.exe dist\LOL海克斯助手\Updater.exe
+Copy-Item README.md dist\LOL海克斯助手\README.md
 
 # 生成更新包（完整 + 增量）与 manifest 模板
 & ".venv\Scripts\python.exe" tools\make_release.py `
     --app-dir "dist\LOL海克斯助手" --version 1.0.3 `
     --notes "release\notes-v1.0.3.md" --out "release\1.0.3" `
-    --previous "build\old-v1.0.2\LOL海克斯助手" --from-version 1.0.2
+    --previous "build\old-v1.0.2\LOL海克斯助手" --from-version 1.0.2 `
+    --exclude-from-incremental "Updater.exe"
 ```
 
 > 本机 pip 需要 `--cert certs\windows_ca_bundle.pem`（由 `tools/export_windows_ca.py` 导出）。

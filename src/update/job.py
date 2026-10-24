@@ -19,6 +19,10 @@ class UpdateJob:
     exe_name: str
     pid: int
     package_size: Optional[int] = None
+    #: 更新版启动后写入的唯一握手 token；用于确认实际运行的是新版。
+    startup_token: str = ""
+    work_dir: str = ""
+    log_path: str = ""
 
     @property
     def install_dir_path(self) -> Path:
@@ -51,6 +55,9 @@ def read_job(path: Path) -> UpdateJob:
         pid=int(payload.get("pid") or 0),
         package_size=(int(payload["package_size"])
                       if payload.get("package_size") is not None else None),
+        startup_token=str(payload.get("startup_token") or ""),
+        work_dir=str(payload.get("work_dir") or ""),
+        log_path=str(payload.get("log_path") or ""),
     )
 
 

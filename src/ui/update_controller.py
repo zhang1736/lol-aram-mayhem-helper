@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import asyncio
 import os
+import secrets
+import shutil
 import subprocess
 import sys
 import threading
@@ -18,7 +20,7 @@ from typing import Callable, Optional
 
 import src as src_pkg
 from src.update.client import UpdateCheckResult, check_for_update
-from src.update.downloader import DownloadProgress, download_sync
+from src.update.downloader import DownloadError, DownloadProgress, download_sync
 from src.update.job import UpdateJob, write_job
 from src.update.manifest import UpdateManifest
 from src.update.version import parse_version
@@ -74,6 +76,7 @@ if PYSIDE6_AVAILABLE:  # pragma: no cover
             self._manifest: Optional[UpdateManifest] = None
             self._prompted: set[str] = set()
             self._shutdown = False
+            self._updater_process = None
 
             self._timer = QtCore.QTimer(self)
             self._timer.setInterval(POLL_INTERVAL_MS)
@@ -246,12 +249,36 @@ if PYSIDE6_AVAILABLE:  # pragma: no cover
                     path = self._download_fn(manifest, dest, on_progress=on_progress,
                                              cancel=self._cancel, timeout=timeout)
                     payload = ("done", path)
+                except DownloadError as exc:
+                    fallback = manifest.as_full_package()
+                    if (manifest.update_type == "incremental"
+                            and exc.fallback_allowed and fallback is not None):
+                        update_log.warning(
+                            "增量包不可用，回退完整包：reason=%s asset=%s",
+                            exc, Path(fallback.package_url.split("?", 1)[0]).name)
+                        try:
+                            path = self._download_fn(
+                                fallback, dest, on_progress=on_progress,
+                                cancel=self._cancel, timeout=timeout)
+                            with self._lock:
+                                self._manifest = fallback
+                            payload = ("done", path)
+                        except Exception as fallback_exc:  # noqa: BLE001
+                            payload = ("error", "增量包失败（%s）；完整包回退失败：%s"
+                                       % (exc, fallback_exc))
+                    else:
+                        payload = ("error", str(exc))
                 except Exception as exc:  # noqa: BLE001
                     payload = ("error", str(exc))
                 with self._lock:
                     self._download_result = payload
 
             update_log.info("开始下载更新包 v%s", manifest.version)
+            update_log.info(
+                "下载选择 type=%s asset=%s expected_bytes=%s from_versions=%s",
+                manifest.update_type,
+                Path(manifest.package_url.split("?", 1)[0]).name,
+                manifest.package_size, manifest.from_versions)
             threading.Thread(target=worker, name="update-download", daemon=True).start()
             self._timer.start()
 
@@ -311,20 +338,42 @@ if PYSIDE6_AVAILABLE:  # pragma: no cover
                 exe_name=exe_name,
                 pid=os.getpid(),
                 package_size=self._manifest.package_size,
+                startup_token=secrets.token_hex(16),
+                work_dir=str(paths.user_data_dir() / "updates"),
+                log_path=str(paths.user_data_dir() / "logs" / "update.log"),
             )
             job_path = paths.user_data_dir() / "updates" / "update-job.json"
             write_job(job_path, job)
             update_log.info("启动更新器: %s（job=%s）", updater, job_path)
-            self._launch_updater(updater, job_path)
+            self._updater_process = self._launch_updater(
+                updater, job_path, startup_token=job.startup_token)
 
-        def _spawn_updater(self, updater: Path, job_path: Path) -> None:
+        def _spawn_updater(self, updater: Path, job_path: Path,
+                           startup_token: str = "") -> object:
+            # 关键：不能直接运行安装目录里的 Updater.exe。更新包会替换它，
+            # 从原路径运行会导致 Windows WinError 32（文件被自身占用）。
+            runtime = paths.user_data_dir() / "updates" / (
+                "Updater-runtime-%s.exe" % os.getpid())
+            runtime.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(updater, runtime)
             flags = 0
             if os.name == "nt":
                 flags = getattr(subprocess, "DETACHED_PROCESS", 0) | \
                     getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-            subprocess.Popen([str(updater), "--job", str(job_path)],
-                             cwd=str(updater.parent), close_fds=True,
-                             creationflags=flags)
+            process = subprocess.Popen(
+                [str(runtime), "--job", str(job_path)],
+                cwd=str(runtime.parent), close_fds=True, creationflags=flags)
+            # 只等待很短时间确认进程仍在运行；Updater 会继续等待主程序退出。
+            deadline = time.monotonic() + 1.0
+            while time.monotonic() < deadline:
+                code = process.poll()
+                if code is not None:
+                    raise RuntimeError(
+                        "更新器启动后立即退出（code=%s，日志见 update.log）" % code)
+                time.sleep(0.05)
+            update_log.info("更新器已启动并从临时路径运行: %s (pid=%s)",
+                            runtime, process.pid)
+            return process
 
         # -- 生命周期 -------------------------------------------------------
         def shutdown(self) -> None:

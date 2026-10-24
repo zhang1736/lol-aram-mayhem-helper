@@ -22,6 +22,13 @@ datas = [
     (os.path.join(PROJECT_ROOT, "certs", "windows_ca_bundle.pem"), "certs"),
 ]
 
+# 先用 updater.spec 生成 dist_updater/Updater.exe，再构建主程序。
+# 该副本位于 _internal/Updater.exe，供旧版安装首次升级后自更新根目录的
+# Updater.exe；根目录旧更新器在首次升级时不能被自身替换。
+_staged_updater = os.path.join(PROJECT_ROOT, "dist_updater", "Updater.exe")
+if os.path.exists(_staged_updater):
+    datas.append((_staged_updater, "."))
+
 # RapidOCR 的 ONNX 模型必须一起打包，否则第一次启动会 FileNotFoundError
 datas += collect_data_files("rapidocr_onnxruntime")
 

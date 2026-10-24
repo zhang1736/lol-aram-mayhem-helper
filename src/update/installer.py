@@ -103,6 +103,10 @@ def safe_relative_path(raw: str) -> PurePosixPath:
             raise UpdateApplyError("更新包包含路径穿越: %r" % raw)
         if ":" in part:
             raise UpdateApplyError("更新包包含非法路径字符: %r" % raw)
+    known_release_roots = {"dist", "lol海克斯助手"}
+    if len(parts) > 1 and parts[0].lower() in known_release_roots:
+        raise UpdateApplyError(
+            "更新包路径包含应用发布目录前缀，拒绝安装到嵌套目录: %r" % raw)
     normalized = "/".join(parts)
     if _is_protected(normalized):
         raise UpdateApplyError("更新包试图修改受保护的用户数据: %r" % raw)

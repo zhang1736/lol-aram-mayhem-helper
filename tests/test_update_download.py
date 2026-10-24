@@ -115,6 +115,50 @@ def test_download_cancel(tmp_path: Path, http_server) -> None:
         asyncio.run(download_package(manifest, tmp_path / "dl", cancel=cancel))
 
 
+def test_download_retries_transient_server_error(tmp_path: Path) -> None:
+    class FlakyHandler(_QuietHandler):
+        requests = 0
+
+        def do_GET(self):
+            type(self).requests += 1
+            if type(self).requests == 1:
+                self.send_response(500)
+                self.end_headers()
+                return
+            return super().do_GET()
+
+    root = tmp_path / "www"
+    root.mkdir()
+    handler = functools.partial(FlakyHandler, directory=str(root))
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        data = b"retry-ok"
+        (root / "u.zip").write_bytes(data)
+        manifest = _manifest(
+            "http://127.0.0.1:%d" % server.server_address[1], "u.zip", data)
+        target = asyncio.run(download_package(
+            manifest, tmp_path / "dl", attempts=2))
+        assert target.read_bytes() == data
+        assert FlakyHandler.requests == 2
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_verified_existing_download_is_reused(tmp_path: Path, http_server) -> None:
+    root, base = http_server
+    data = b"already-downloaded"
+    (root / "u.zip").write_bytes(data)
+    manifest = _manifest(base, "u.zip", data)
+    dest = tmp_path / "dl"
+    first = asyncio.run(download_package(manifest, dest))
+    (root / "u.zip").unlink()              # 若再次请求会得到 404
+    second = asyncio.run(download_package(manifest, dest))
+    assert second == first
+    assert second.read_bytes() == data
+
+
 def test_check_for_update_uses_real_http(tmp_path: Path, http_server) -> None:
     root, base = http_server
     payload = {"version": "1.0.2", "package_url": base + "/u.zip",

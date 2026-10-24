@@ -78,6 +78,15 @@ def test_safe_path_rejects_dangerous(bad: str) -> None:
         safe_relative_path(bad)
 
 
+@pytest.mark.parametrize("bad", [
+    "dist/LOL海克斯助手/LOL海克斯助手.exe",
+    "LOL海克斯助手/_internal/base_library.zip",
+])
+def test_safe_path_rejects_release_root_prefix(bad: str) -> None:
+    with pytest.raises(UpdateApplyError, match="发布目录前缀"):
+        safe_relative_path(bad)
+
+
 @pytest.mark.parametrize("bad", ["../evil.dll", "C:/abs.dll", "data/aram_helper.db"])
 def test_package_with_unsafe_path_refused(tmp_path: Path, bad: str) -> None:
     root = _install_dir(tmp_path)

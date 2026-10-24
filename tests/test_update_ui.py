@@ -129,8 +129,9 @@ class Recorder:
         self.dialogs.append(dialog)
         return dialog
 
-    def launcher(self, updater, job_path):
+    def launcher(self, updater, job_path, startup_token=""):
         self.launched.append((updater, job_path))
+        return object()
 
 
 def _controller(qapp, isolated_home, rec: Recorder, result: UpdateCheckResult,
@@ -296,4 +297,47 @@ def test_download_error_offers_retry(qapp, isolated_home, tmp_path) -> None:
     assert rec.dialogs[0].install_button.text() == "重试下载"
     assert "网络中断" in rec.dialogs[0].status_label.text()
     assert rec.launched == []
+    controller.shutdown()
+
+
+def test_controller_runs_updater_from_temp_copy(qapp, isolated_home,
+                                                tmp_path, monkeypatch) -> None:
+    """安装目录中的 Updater 不能被自身锁定，必须从临时副本运行。"""
+    from src.ui import update_controller
+
+    rec = Recorder()
+    controller = update_controller.UpdateController(
+        _settings(), current_version="1.0.2",
+        feedback=rec.feedback, on_quit=rec.on_quit)
+    app_dir = tmp_path / "已安装 目录"
+    app_dir.mkdir()
+    updater = app_dir / "Updater.exe"
+    updater.write_bytes(b"updater")
+    package = tmp_path / "update.zip"
+    package.write_bytes(b"package")
+    controller.install_dir = lambda: app_dir
+    controller.updater_path = lambda: updater
+    controller._manifest = _manifest("1.0.3")
+
+    class Proc:
+        pid = 4321
+
+        def poll(self):
+            return None
+
+    called = {}
+
+    def fake_popen(args, **kwargs):
+        called["args"] = args
+        called["kwargs"] = kwargs
+        return Proc()
+
+    monkeypatch.setattr(update_controller.subprocess, "Popen", fake_popen)
+    controller._prepare_and_launch(package)
+
+    launched = Path(called["args"][0]).resolve()
+    assert launched.parent == (isolated_home / "updates").resolve()
+    assert launched != updater.resolve()
+    assert launched.exists()
+    assert Path(called["args"][2]).exists()
     controller.shutdown()

@@ -14,6 +14,7 @@ import argparse
 import asyncio
 import sys
 
+import src as src_pkg
 from src.config import Settings, load_settings
 from src.core.game_session import GameSession
 from src.core.state_machine import AppState, StateMachine
@@ -24,6 +25,8 @@ from src.lcu.credential import LcuCredentialProvider
 from src.lcu.gameflow import GameflowMonitor, GamePhase
 from src.overlay.manager import OverlayManager, OverlayUnavailableError, launch_overlay
 from src.overlay.window import MISSING_PYSIDE_MESSAGE
+from src.update.bootstrap import ensure_embedded_updater
+from src.update.startup import write_startup_marker
 from src.utils.logger import force_utf8_stdio, get_logger, get_tagged, setup_logging
 
 logger = get_logger(__name__)
@@ -111,6 +114,8 @@ def run(argv: list[str] | None = None) -> int:
                   root=settings.config_dir)
 
     logger.info("=== LOL ARAM: Mayhem Helper 启动 ===")
+    logger.info("版本: %s", src_pkg.__version__)
+    ensure_embedded_updater()
     logger.info("英雄统计口径: %s", settings.hero_scope_label)
     logger.info("海克斯统计口径: %s（该接口无法按 region/tier 过滤）",
                 settings.augment_scope_label)
@@ -118,6 +123,7 @@ def run(argv: list[str] | None = None) -> int:
 
     database = Database(settings.database_file)
     database.initialize()
+    write_startup_marker(src_pkg.__version__)
 
     try:
         if args.live or args.resident:
